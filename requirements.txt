@@ -3,5 +3,5 @@ uvicorn[standard]
 pandas
 openpyxl
 python-jose[cryptography]
-passlib[bcrypt]
+bcrypt
 python-multipart

@@ -49,7 +49,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt as _bcrypt
 from pydantic import BaseModel
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
@@ -100,7 +100,6 @@ OP_FILENAME_HINTS: dict[str, list[str]] = {
 
 ROLES = {"ADMIN", "GESTOR", "OPERACIONAL"}
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer  = HTTPBearer()
 
 
@@ -119,11 +118,14 @@ _cache_lock: asyncio.Lock
 
 
 def _hash(plain: str) -> str:
-    return pwd_ctx.hash(plain)
+    return _bcrypt.hashpw(plain.encode(), _bcrypt.gensalt()).decode()
 
 
 def _verify(plain: str, hashed: str) -> bool:
-    return pwd_ctx.verify(plain, hashed)
+    try:
+        return _bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
 
 
 def _create_token(user: User) -> str:
