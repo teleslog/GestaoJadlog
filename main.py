@@ -37,6 +37,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import uuid
 import zipfile
@@ -71,6 +72,26 @@ DB_PATH   = Path(os.environ.get("DB_PATH", str(BASE_DIR / "users.db")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("api")
+
+# ── VERSÃO ─────────────────────────────────────────────────────────────────────
+
+def _get_version() -> str:
+    """Gera string de versão: vAAAA.MM.DD.<git-short-hash> ou vAAAA.MM.DD.HHmm."""
+    date = datetime.now(timezone.utc).strftime("%Y.%m.%d")
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BASE_DIR), stderr=subprocess.DEVNULL, timeout=3,
+        ).decode().strip()
+        if commit:
+            return f"v{date}.{commit}"
+    except Exception:
+        pass
+    return datetime.now(timezone.utc).strftime("v%Y.%m.%d.%H%M")
+
+
+APP_VERSION:    str = ""
+_dashboard_html: str = ""
 
 # ── OPERAÇÕES ──────────────────────────────────────────────────────────────────
 
@@ -566,9 +587,17 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    global users_lock, _cache_lock
+    global users_lock, _cache_lock, APP_VERSION, _dashboard_html
     users_lock  = asyncio.Lock()
     _cache_lock = asyncio.Lock()
+
+    # Versão e HTML pré-processado (substituição única no startup)
+    APP_VERSION = _get_version()
+    log.info(f"[startup] Versão: {APP_VERSION}")
+    if DASHBOARD.exists():
+        _dashboard_html = DASHBOARD.read_text(encoding="utf-8").replace("{{APP_VERSION}}", APP_VERSION)
+    else:
+        _dashboard_html = ""
 
     # Cria apenas as duas pastas necessárias
     FIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -601,10 +630,21 @@ async def startup():
 
 # ── ROTAS PÚBLICAS ─────────────────────────────────────────────────────────────
 
+_NO_CACHE = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma":        "no-cache",
+    "Expires":       "0",
+}
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
+    if _dashboard_html:
+        return HTMLResponse(content=_dashboard_html, headers=_NO_CACHE)
     if DASHBOARD.exists():
-        return DASHBOARD.read_text(encoding="utf-8")
+        return HTMLResponse(
+            content=DASHBOARD.read_text(encoding="utf-8").replace("{{APP_VERSION}}", APP_VERSION),
+            headers=_NO_CACHE,
+        )
     return HTMLResponse("<h2>GestãoEntregas.html não encontrado</h2>", status_code=503)
 
 # ── AUTH ───────────────────────────────────────────────────────────────────────

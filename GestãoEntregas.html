@@ -2,6 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
+<meta name="app-version" content="{{APP_VERSION}}">
 <title>GestãoEntregas</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23CC0000'/><rect x='3' y='10' width='15' height='10' rx='1.5' fill='white'/><path d='M18 13h6l3 4.5V23h-9z' fill='white'/><path d='M19.5 14.5h4l2 3h-6z' fill='%23CC0000'/><circle cx='8' cy='23' r='2.8' fill='white'/><circle cx='8' cy='23' r='1.2' fill='%23CC0000'/><circle cx='24' cy='23' r='2.8' fill='white'/><circle cx='24' cy='23' r='1.2' fill='%23CC0000'/></svg>">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -403,6 +404,7 @@ tr:hover td{background:#FFF5F5;}
   <div class="sidebar-footer">
     <div class="clock" id="clock"></div>
     <div id="sidebar-user" style="color:rgba(255,255,255,0.6);font-size:10px;margin-top:6px;display:none"></div>
+    <div style="color:rgba(255,255,255,0.25);font-size:9px;margin-top:8px;letter-spacing:0.4px">{{APP_VERSION}}</div>
   </div>
 </aside>
 
@@ -3072,6 +3074,9 @@ function nav(page,el){
 }
 
 // ── INICIALIZAÇÃO AUTOMÁTICA ──────────────────────────────────────────────────
+const _APP_VERSION=document.querySelector('meta[name="app-version"]')?.content||'';
+if(_APP_VERSION)console.log('%cGestãoEntregas '+_APP_VERSION,'color:#E1262E;font-weight:bold;font-size:13px');
+
 (async()=>{
   _updateAuthUI();
   if(!_authToken){

@@ -9,6 +9,11 @@ venv/
 # Excel temporários
 ~$*
 
+# Runtime / local
+users.db
+server.log
+server.err
+
 # OS
 .DS_Store
 Thumbs.db
