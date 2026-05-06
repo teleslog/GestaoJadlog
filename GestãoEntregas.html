@@ -464,19 +464,22 @@ tr:hover td{background:#FFF5F5;}
             </select>
           </div>
           <div class="modal-field">
-            <label class="modal-label">Arquivo (.xlsx)</label>
-            <input type="file" id="up-file" accept=".xlsx,.zip" style="width:100%;border:1.5px dashed #DDD;border-radius:8px;padding:12px;font-size:12px;cursor:pointer;outline:none;">
+            <label class="modal-label">Arquivo(s) (.xlsx / .zip)</label>
+            <input type="file" id="up-file" accept=".xlsx,.zip" multiple
+                   style="width:100%;border:1.5px dashed #DDD;border-radius:8px;padding:12px;font-size:12px;cursor:pointer;outline:none;"
+                   onchange="_onUpFileChange()">
+            <div id="up-file-label" style="font-size:11px;color:#888;margin-top:6px;min-height:16px"></div>
           </div>
-          <button class="login-btn" style="width:auto;padding:12px 32px;margin-top:4px" onclick="_doUpload()">Enviar Arquivo</button>
+          <button class="login-btn" style="width:auto;padding:12px 32px;margin-top:4px" onclick="_doUpload()">Enviar Arquivo(s)</button>
           <div id="up-msg" style="margin-top:14px;font-size:12px;min-height:18px"></div>
         </div>
         <div class="panel" style="padding:28px">
           <div style="font-size:10px;font-weight:700;color:#555;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:16px">Como funciona</div>
           <div style="font-size:12px;color:#555;line-height:1.8">
             <p>1. Selecione o <strong>tipo</strong> (Operacional ou Financeiro)</p>
-            <p>2. Clique em <strong>Escolher arquivo</strong> e selecione o <strong>.xlsx</strong> ou <strong>.zip</strong> exportado</p>
-            <p>3. Clique em <strong>Enviar Arquivo</strong></p>
-            <p style="margin-top:12px;color:#888">O sistema identifica automaticamente a operação pelo conteúdo do arquivo (GV, Itabira, JM ou Curvelo). Arquivos <strong>.zip</strong> são extraídos automaticamente — basta enviar o zip sem precisar extrair manualmente.</p>
+            <p>2. Clique em <strong>Escolher arquivo(s)</strong> e selecione um ou mais arquivos <strong>.xlsx</strong> ou <strong>.zip</strong></p>
+            <p>3. Clique em <strong>Enviar Arquivo(s)</strong></p>
+            <p style="margin-top:12px;color:#888">O sistema identifica automaticamente a operação pelo conteúdo de cada arquivo (GV, Itabira, JM ou Curvelo). Arquivos <strong>.zip</strong> são extraídos automaticamente. Você pode enviar <strong>vários arquivos de uma vez</strong> — todos do mesmo tipo escolhido acima.</p>
           </div>
         </div>
       </div>
@@ -1139,7 +1142,7 @@ function _hideLoginOverlay(){
   if(ov)ov.classList.remove('visible');
 }
 
-const _CAN_UPLOAD=['DIRETOR','SUPERVISAO'];
+const _CAN_UPLOAD=['DIRETOR','SUPERVISAO','OPERACIONAL','FINANCEIRO'];
 const _CAN_ADMIN=['DIRETOR'];
 const _ROLE_LABELS={DIRETOR:'Diretor',SUPERVISAO:'Supervisão',OPERACIONAL:'Operacional',FINANCEIRO:'Financeiro',VISUALIZACAO:'Visualização'};
 
@@ -1417,36 +1420,71 @@ async function _deleteUser(uid,login){
 
 // ── IMPORTAR ARQUIVOS ─────────────────────────────────────────────────────────
 
+function _onUpFileChange(){
+  const fileInput=document.getElementById('up-file');
+  const lbl=document.getElementById('up-file-label');
+  if(!lbl)return;
+  const n=fileInput.files.length;
+  if(n===0)lbl.textContent='';
+  else if(n===1)lbl.textContent=fileInput.files[0].name;
+  else lbl.textContent=n+' arquivo(s) selecionado(s)';
+}
+
 async function _doUpload(){
   const tipo=document.getElementById('up-tipo').value;
   const fileInput=document.getElementById('up-file');
   const msg=document.getElementById('up-msg');
-  if(!fileInput.files.length){msg.style.color='#CC0000';msg.textContent='Selecione um arquivo .xlsx.';return;}
-  const file=fileInput.files[0];
-  const fext=file.name.toLowerCase();
-  if(!fext.endsWith('.xlsx')&&!fext.endsWith('.zip')){msg.style.color='#CC0000';msg.textContent='Apenas arquivos .xlsx ou .zip são aceitos.';return;}
-  msg.style.color='#888';msg.textContent='Enviando...';
-  try{
-    const fd=new FormData();
-    fd.append('file',file);
-    const resp=await fetch(`${API_BASE}/upload/${tipo}`,{
-      method:'POST',headers:_authHeaders(),body:fd
-    });
-    if(resp.status===401){_doLogout();return;}
-    const data=await resp.json();
-    if(data.erro){msg.style.color='#CC0000';msg.textContent='Erro: '+data.erro;}
-    else{
-      const ops=(data.operacoes||[]).map(o=>o.op||o.key).join(', ')||'—';
-      msg.style.color='#1A8C4E';
-      msg.textContent=`✓ ${file.name} importado. Operações detectadas: ${ops}`;
-      fileInput.value='';
-      showToast('Arquivo importado com sucesso!','#1A8C4E');
-      _loadImportStatus();
-      if(dashboardVisible)setTimeout(()=>fetchAll(true),500);
-    }
-  }catch(e){
-    msg.style.color='#CC0000';msg.textContent='Erro de conexão: '+e.message;
+  if(!fileInput.files.length){
+    msg.style.color='#CC0000';
+    msg.textContent='Selecione ao menos um arquivo .xlsx ou .zip.';
+    return;
   }
+  const valid=[],invalid=[];
+  for(const f of fileInput.files){
+    const n=f.name.toLowerCase();
+    if(n.endsWith('.xlsx')||n.endsWith('.zip'))valid.push(f);
+    else invalid.push(f.name);
+  }
+  if(invalid.length){
+    msg.style.color='#CC0000';
+    msg.textContent='Formato inválido (só .xlsx/.zip): '+invalid.join(', ');
+    return;
+  }
+  const total=valid.length;
+  const erros=[];
+  let enviados=0;
+  for(let i=0;i<total;i++){
+    const file=valid[i];
+    msg.style.color='#888';
+    msg.textContent=`Enviando ${i+1}/${total}: ${file.name}`;
+    try{
+      const fd=new FormData();
+      fd.append('file',file);
+      const resp=await fetch(`${API_BASE}/upload/${tipo}`,{
+        method:'POST',headers:_authHeaders(),body:fd
+      });
+      if(resp.status===401){_doLogout();return;}
+      const data=await resp.json();
+      if(!resp.ok||data.erro)erros.push(`${file.name} (${data.detail||data.erro||'erro'})`);
+      else enviados++;
+    }catch(e){
+      erros.push(`${file.name} (conexão: ${e.message})`);
+    }
+  }
+  fileInput.value='';
+  const lbl=document.getElementById('up-file-label');
+  if(lbl)lbl.textContent='';
+  if(erros.length===0){
+    msg.style.color='#1A8C4E';
+    msg.textContent=`✓ ${total} arquivo(s) enviado(s) com sucesso.`;
+    showToast(total===1?'Arquivo importado com sucesso!':total+' arquivos importados com sucesso!','#1A8C4E');
+  }else{
+    msg.style.color='#C48A00';
+    msg.textContent=`⚠ ${enviados}/${total} enviado(s). Falhou: `+erros.join(' | ');
+    if(enviados>0)showToast(enviados+'/'+total+' arquivo(s) importado(s).','#C48A00');
+  }
+  _loadImportStatus();
+  if(dashboardVisible)setTimeout(()=>fetchAll(true),500);
 }
 
 async function _loadImportStatus(){

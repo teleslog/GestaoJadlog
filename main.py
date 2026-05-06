@@ -106,7 +106,7 @@ ROLES = {"DIRETOR", "SUPERVISAO", "OPERACIONAL", "FINANCEIRO", "VISUALIZACAO"}
 # Controle de acesso por perfil
 CAN_VIEW_OP  = {"DIRETOR", "SUPERVISAO", "OPERACIONAL", "VISUALIZACAO"}
 CAN_VIEW_FIN = {"DIRETOR", "SUPERVISAO", "FINANCEIRO",  "VISUALIZACAO"}
-CAN_UPLOAD   = {"DIRETOR", "SUPERVISAO"}
+CAN_UPLOAD   = {"DIRETOR", "SUPERVISAO", "OPERACIONAL", "FINANCEIRO"}
 CAN_ADMIN    = {"DIRETOR"}
 
 ROLE_LABELS = {
@@ -235,7 +235,7 @@ def _require_admin(user: User = Depends(_get_current_user)) -> User:
 
 def _require_gestor(user: User = Depends(_get_current_user)) -> User:
     if user.role not in CAN_UPLOAD:
-        raise HTTPException(403, "Acesso restrito a Diretores e Supervisão")
+        raise HTTPException(403, "Acesso restrito a Diretores, Supervisão, Operacional e Financeiro")
     return user
 
 # ── MODELOS ────────────────────────────────────────────────────────────────────
