@@ -275,12 +275,14 @@ tr:hover td{background:#FFF5F5;}
     <div class="login-sub">Acesso restrito — faça login para continuar</div>
     <div class="login-field">
       <label class="login-label">Usuário</label>
-      <input class="login-input" type="text" id="login-user" placeholder="seu login" autocomplete="username"
+      <input class="login-input" type="text" id="login-user" placeholder="seu login"
+             autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false"
              onkeydown="if(event.key==='Enter')document.getElementById('login-pass').focus()">
     </div>
     <div class="login-field">
       <label class="login-label">Senha</label>
-      <input class="login-input" type="password" id="login-pass" placeholder="sua senha" autocomplete="current-password"
+      <input class="login-input" type="password" id="login-pass" placeholder="sua senha"
+             autocomplete="current-password" autocapitalize="none" autocorrect="off"
              onkeydown="if(event.key==='Enter')_doLogin()">
     </div>
     <button class="login-btn" id="login-btn" onclick="_doLogin()">Entrar</button>
@@ -1148,8 +1150,8 @@ function _updateAuthUI(){
 }
 
 async function _doLogin(){
-  const login=(document.getElementById('login-user').value||'').trim();
-  const pass=document.getElementById('login-pass').value||'';
+  const login=(document.getElementById('login-user').value||'').trim().toLowerCase();
+  const pass=(document.getElementById('login-pass').value||'').trim();
   const errEl=document.getElementById('login-err');
   const btn=document.getElementById('login-btn');
   if(errEl)errEl.textContent='';

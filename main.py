@@ -46,6 +46,7 @@ from typing import Optional
 
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -474,6 +475,12 @@ async def _background_refresh():
 # ── APP ────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="GestãoEntregas", docs_url=None, redoc_url=None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -514,8 +521,8 @@ async def root():
 @app.post("/auth/login")
 async def login(req: LoginRequest):
     async with users_lock:
-        user = next((u for u in users_db.values() if u.login == req.login), None)
-    if not user or not _verify(req.password, user.password_hash):
+        user = next((u for u in users_db.values() if u.login.lower() == req.login.lower()), None)
+    if not user or not _verify(req.password.strip(), user.password_hash):
         raise HTTPException(401, "Login ou senha inválidos")
     return {
         "access_token":        _create_token(user),
