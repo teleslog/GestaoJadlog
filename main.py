@@ -58,7 +58,7 @@ REFRESH_SECONDS        = int(os.environ.get("REFRESH_SECONDS", "300"))
 JWT_SECRET             = os.environ.get("JWT_SECRET", "mude-em-producao-use-openssl-rand-hex-32")
 JWT_ALGORITHM          = "HS256"
 JWT_EXPIRE_HOURS       = 12
-DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Admin@123")
+DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Jadlog2026")[:72]
 
 BASE_DIR  = Path(__file__).parent
 DADOS_DIR = BASE_DIR / "dados"
