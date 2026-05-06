@@ -36,6 +36,7 @@ import io
 import logging
 import os
 import shutil
+import sqlite3
 import tempfile
 import uuid
 import zipfile
@@ -66,6 +67,7 @@ DADOS_DIR = BASE_DIR / "dados"
 FIN_DIR   = DADOS_DIR / "financeiro"
 OP_DIR    = DADOS_DIR / "operacional"
 DASHBOARD = BASE_DIR / "GestãoEntregas.html"
+DB_PATH   = Path(os.environ.get("DB_PATH", str(BASE_DIR / "users.db")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("api")
@@ -99,7 +101,21 @@ OP_FILENAME_HINTS: dict[str, list[str]] = {
 
 # ── AUTH ───────────────────────────────────────────────────────────────────────
 
-ROLES = {"ADMIN", "GESTOR", "OPERACIONAL"}
+ROLES = {"DIRETOR", "SUPERVISAO", "OPERACIONAL", "FINANCEIRO", "VISUALIZACAO"}
+
+# Controle de acesso por perfil
+CAN_VIEW_OP  = {"DIRETOR", "SUPERVISAO", "OPERACIONAL", "VISUALIZACAO"}
+CAN_VIEW_FIN = {"DIRETOR", "SUPERVISAO", "FINANCEIRO",  "VISUALIZACAO"}
+CAN_UPLOAD   = {"DIRETOR", "SUPERVISAO"}
+CAN_ADMIN    = {"DIRETOR"}
+
+ROLE_LABELS = {
+    "DIRETOR":     "Diretor",
+    "SUPERVISAO":  "Supervisão",
+    "OPERACIONAL": "Operacional",
+    "FINANCEIRO":  "Financeiro",
+    "VISUALIZACAO":"Visualização",
+}
 
 bearer  = HTTPBearer()
 
@@ -108,14 +124,70 @@ bearer  = HTTPBearer()
 class User:
     id: str
     login: str
+    nome: str
     password_hash: str
     role: str
+    ativo: bool = True
     must_change_password: bool = False
 
 
 users_db:   dict[str, User] = {}
 users_lock: asyncio.Lock
 _cache_lock: asyncio.Lock
+
+
+# ── SQLITE ─────────────────────────────────────────────────────────────────────
+
+def _db():
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    with _db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            id                   TEXT PRIMARY KEY,
+            login                TEXT UNIQUE NOT NULL,
+            nome                 TEXT NOT NULL DEFAULT '',
+            password_hash        TEXT NOT NULL,
+            role                 TEXT NOT NULL,
+            ativo                INTEGER NOT NULL DEFAULT 1,
+            must_change_password INTEGER NOT NULL DEFAULT 1
+        )""")
+        conn.commit()
+
+
+def _upsert_user(u: User):
+    with _db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO users
+               (id, login, nome, password_hash, role, ativo, must_change_password)
+               VALUES (?,?,?,?,?,?,?)""",
+            (u.id, u.login, u.nome, u.password_hash, u.role,
+             int(u.ativo), int(u.must_change_password)),
+        )
+        conn.commit()
+
+
+def _delete_user_db(uid: str):
+    with _db() as conn:
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.commit()
+
+
+def _load_users_db() -> list[User]:
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM users").fetchall()
+    return [
+        User(
+            id=r["id"], login=r["login"], nome=r["nome"] or "",
+            password_hash=r["password_hash"], role=r["role"],
+            ativo=bool(r["ativo"]),
+            must_change_password=bool(r["must_change_password"]),
+        )
+        for r in rows
+    ]
 
 
 def _hash(plain: str) -> str:
@@ -150,18 +222,20 @@ async def _get_current_user(
         user = users_db.get(uid)
     if not user:
         raise HTTPException(401, "Usuário não encontrado")
+    if not user.ativo:
+        raise HTTPException(401, "Usuário desativado. Contate o administrador.")
     return user
 
 
 def _require_admin(user: User = Depends(_get_current_user)) -> User:
-    if user.role != "ADMIN":
-        raise HTTPException(403, "Acesso restrito a ADMIN")
+    if user.role not in CAN_ADMIN:
+        raise HTTPException(403, "Acesso restrito a Diretores")
     return user
 
 
 def _require_gestor(user: User = Depends(_get_current_user)) -> User:
-    if user.role not in {"ADMIN", "GESTOR"}:
-        raise HTTPException(403, "Acesso restrito a ADMIN e GESTOR")
+    if user.role not in CAN_UPLOAD:
+        raise HTTPException(403, "Acesso restrito a Diretores e Supervisão")
     return user
 
 # ── MODELOS ────────────────────────────────────────────────────────────────────
@@ -178,15 +252,22 @@ class ChangePasswordRequest(BaseModel):
 
 class CreateUserRequest(BaseModel):
     login: str
+    nome: str
     password: str
     role: str
 
 
 class UpdateUserRequest(BaseModel):
     login: Optional[str] = None
+    nome: Optional[str] = None
     password: Optional[str] = None
     role: Optional[str] = None
+    ativo: Optional[bool] = None
     must_change_password: Optional[bool] = None
+
+
+class ResetSenhaRequest(BaseModel):
+    nova_senha: str
 
 # ── DETECÇÃO DE OPERAÇÃO ───────────────────────────────────────────────────────
 
@@ -494,14 +575,24 @@ async def startup():
     OP_DIR.mkdir(parents=True, exist_ok=True)
     log.info(f"[startup] Pastas: {FIN_DIR} | {OP_DIR}")
 
-    # Usuário admin padrão (must_change_password=True no primeiro acesso)
-    admin_id = str(uuid.uuid4())
-    users_db[admin_id] = User(
-        id=admin_id, login="admin",
-        password_hash=_hash(DEFAULT_ADMIN_PASSWORD),
-        role="ADMIN", must_change_password=True,
-    )
-    log.info("[startup] Usuário admin criado (login=admin)")
+    # Inicializa banco SQLite e carrega usuários persistidos
+    _init_db()
+    async with users_lock:
+        for u in _load_users_db():
+            users_db[u.id] = u
+        log.info(f"[startup] {len(users_db)} usuário(s) carregado(s) do banco")
+
+        # Cria Diretor padrão apenas se não houver nenhum
+        if not any(u.role == "DIRETOR" for u in users_db.values()):
+            admin_id = str(uuid.uuid4())
+            admin = User(
+                id=admin_id, login="admin", nome="Administrador",
+                password_hash=_hash(DEFAULT_ADMIN_PASSWORD),
+                role="DIRETOR", ativo=True, must_change_password=True,
+            )
+            users_db[admin_id] = admin
+            _upsert_user(admin)
+            log.info("[startup] Usuário admin (Diretor) criado e salvo no banco")
 
     log.info("[startup] Escaneando pastas de dados...")
     await refresh_all()
@@ -545,6 +636,7 @@ async def change_password(
         users_db[user.id].password_hash = _hash(req.new_password)
         users_db[user.id].must_change_password = False
         updated = users_db[user.id]
+        _upsert_user(updated)
     return {"access_token": _create_token(updated), "token_type": "bearer"}
 
 # ── GESTÃO DE USUÁRIOS (ADMIN) ─────────────────────────────────────────────────
@@ -552,26 +644,33 @@ async def change_password(
 @app.get("/usuarios")
 async def list_users(admin: User = Depends(_require_admin)):
     async with users_lock:
-        return [{"id": u.id, "login": u.login, "role": u.role,
-                 "must_change_password": u.must_change_password}
-                for u in users_db.values()]
+        return [
+            {"id": u.id, "login": u.login, "nome": u.nome, "role": u.role,
+             "ativo": u.ativo, "must_change_password": u.must_change_password}
+            for u in users_db.values()
+        ]
 
 
 @app.post("/usuarios", status_code=201)
 async def create_user(req: CreateUserRequest, admin: User = Depends(_require_admin)):
     if req.role not in ROLES:
         raise HTTPException(400, f"Role inválido. Use: {', '.join(sorted(ROLES))}")
+    if len(req.password) < 6:
+        raise HTTPException(400, "Senha deve ter ao menos 6 caracteres")
     async with users_lock:
-        if any(u.login == req.login for u in users_db.values()):
+        if any(u.login.lower() == req.login.lower() for u in users_db.values()):
             raise HTTPException(409, f"Login '{req.login}' já existe")
         uid = str(uuid.uuid4())
-        users_db[uid] = User(
-            id=uid, login=req.login,
+        new_user = User(
+            id=uid, login=req.login.lower(), nome=req.nome,
             password_hash=_hash(req.password),
-            role=req.role, must_change_password=True,
+            role=req.role, ativo=True, must_change_password=True,
         )
+        users_db[uid] = new_user
+        _upsert_user(new_user)
     log.info(f"[usuario] criado: {req.login} ({req.role})")
-    return {"id": uid, "login": req.login, "role": req.role, "must_change_password": True}
+    return {"id": uid, "login": new_user.login, "nome": new_user.nome,
+            "role": req.role, "ativo": True, "must_change_password": True}
 
 
 @app.put("/usuarios/{uid}")
@@ -581,9 +680,11 @@ async def update_user(uid: str, req: UpdateUserRequest, admin: User = Depends(_r
         if not user:
             raise HTTPException(404, "Usuário não encontrado")
         if req.login is not None:
-            if any(u.login == req.login and u.id != uid for u in users_db.values()):
+            if any(u.login.lower() == req.login.lower() and u.id != uid for u in users_db.values()):
                 raise HTTPException(409, f"Login '{req.login}' já existe")
-            user.login = req.login
+            user.login = req.login.lower()
+        if req.nome is not None:
+            user.nome = req.nome
         if req.password is not None:
             if len(req.password) < 6:
                 raise HTTPException(400, "Senha deve ter ao menos 6 caracteres")
@@ -592,10 +693,13 @@ async def update_user(uid: str, req: UpdateUserRequest, admin: User = Depends(_r
             if req.role not in ROLES:
                 raise HTTPException(400, f"Role inválido. Use: {', '.join(sorted(ROLES))}")
             user.role = req.role
+        if req.ativo is not None:
+            user.ativo = req.ativo
         if req.must_change_password is not None:
             user.must_change_password = req.must_change_password
-    return {"id": uid, "login": user.login, "role": user.role,
-            "must_change_password": user.must_change_password}
+        _upsert_user(user)
+    return {"id": uid, "login": user.login, "nome": user.nome, "role": user.role,
+            "ativo": user.ativo, "must_change_password": user.must_change_password}
 
 
 @app.delete("/usuarios/{uid}", status_code=204)
@@ -604,10 +708,42 @@ async def delete_user(uid: str, admin: User = Depends(_require_admin)):
         user = users_db.get(uid)
         if not user:
             raise HTTPException(404, "Usuário não encontrado")
-        if user.role == "ADMIN" and sum(1 for u in users_db.values() if u.role == "ADMIN") == 1:
-            raise HTTPException(400, "Não é possível remover o único administrador")
+        if uid == admin.id:
+            raise HTTPException(400, "Você não pode remover sua própria conta")
+        if user.role == "DIRETOR" and sum(1 for u in users_db.values() if u.role == "DIRETOR") == 1:
+            raise HTTPException(400, "Não é possível remover o único Diretor")
         del users_db[uid]
+        _delete_user_db(uid)
     log.info(f"[usuario] removido: {user.login}")
+
+
+@app.post("/usuarios/{uid}/reset-senha", status_code=200)
+async def reset_senha(uid: str, req: ResetSenhaRequest, admin: User = Depends(_require_admin)):
+    if len(req.nova_senha) < 6:
+        raise HTTPException(400, "Senha deve ter ao menos 6 caracteres")
+    async with users_lock:
+        user = users_db.get(uid)
+        if not user:
+            raise HTTPException(404, "Usuário não encontrado")
+        user.password_hash = _hash(req.nova_senha)
+        user.must_change_password = True
+        _upsert_user(user)
+    log.info(f"[usuario] senha redefinida: {user.login}")
+    return {"ok": True, "login": user.login}
+
+
+@app.patch("/usuarios/{uid}/ativo", status_code=200)
+async def toggle_ativo(uid: str, admin: User = Depends(_require_admin)):
+    async with users_lock:
+        user = users_db.get(uid)
+        if not user:
+            raise HTTPException(404, "Usuário não encontrado")
+        if uid == admin.id:
+            raise HTTPException(400, "Você não pode desativar sua própria conta")
+        user.ativo = not user.ativo
+        _upsert_user(user)
+    log.info(f"[usuario] {'ativado' if user.ativo else 'desativado'}: {user.login}")
+    return {"ok": True, "login": user.login, "ativo": user.ativo}
 
 # ── DADOS ──────────────────────────────────────────────────────────────────────
 
@@ -620,6 +756,10 @@ async def get_dados(
         raise HTTPException(404, f"Tipo inválido: '{tipo}'. Use: financeiro, operacional")
     if key not in OPS:
         raise HTTPException(404, f"Operação inválida: '{key}'. Use: {', '.join(OPS)}")
+    if tipo == "operacional" and user.role not in CAN_VIEW_OP:
+        raise HTTPException(403, "Seu perfil não tem acesso aos dados operacionais")
+    if tipo == "financeiro" and user.role not in CAN_VIEW_FIN:
+        raise HTTPException(403, "Seu perfil não tem acesso aos dados financeiros")
     async with _cache_lock:
         entry = _cache.get(tipo, {}).get(key)
     if entry is None:

@@ -237,9 +237,14 @@ tr:hover td{background:#FFF5F5;}
 .chpwd-box{background:white;border-radius:16px;padding:40px;width:420px;box-shadow:0 24px 60px rgba(0,0,0,0.5);}
 /* ADMIN */
 .user-role-badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 10px;border-radius:20px;}
-.role-ADMIN{background:#CC0000;color:white;}
-.role-GESTOR{background:#1A6FCC;color:white;}
+.role-DIRETOR{background:#1A1A1A;color:white;}
+.role-SUPERVISAO{background:#1A6FCC;color:white;}
 .role-OPERACIONAL{background:#1A8C4E;color:white;}
+.role-FINANCEIRO{background:#7B2D9E;color:white;}
+.role-VISUALIZACAO{background:#888;color:white;}
+.badge-ativo{display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;border-radius:20px;}
+.badge-ativo.sim{background:#D4F5E2;color:#1A8C4E;}
+.badge-ativo.nao{background:#FFE0E0;color:#CC0000;}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:500;align-items:center;justify-content:center;}
 .modal-overlay.open{display:flex;}
 .modal-box{background:white;border-radius:12px;padding:32px;width:420px;box-shadow:0 12px 40px rgba(0,0,0,0.35);}
@@ -318,8 +323,13 @@ tr:hover td{background:#FFF5F5;}
   <div class="modal-box">
     <div class="modal-title" id="user-modal-title">Novo Usuário</div>
     <div class="modal-field">
+      <label class="modal-label">Nome completo</label>
+      <input class="modal-input" type="text" id="umod-nome" placeholder="nome do usuário">
+    </div>
+    <div class="modal-field">
       <label class="modal-label">Login</label>
-      <input class="modal-input" type="text" id="umod-login" placeholder="login do usuário">
+      <input class="modal-input" type="text" id="umod-login" placeholder="login (sem espaços, minúsculas)"
+             autocapitalize="none" autocorrect="off" spellcheck="false">
     </div>
     <div class="modal-field">
       <label class="modal-label">Senha <span id="umod-pwd-hint" style="color:#AAA;font-weight:400;text-transform:none;font-size:10px">(deixe em branco para não alterar)</span></label>
@@ -328,9 +338,11 @@ tr:hover td{background:#FFF5F5;}
     <div class="modal-field">
       <label class="modal-label">Perfil</label>
       <select class="modal-select" id="umod-role">
-        <option value="OPERACIONAL">OPERACIONAL</option>
-        <option value="GESTOR">GESTOR</option>
-        <option value="ADMIN">ADMIN</option>
+        <option value="VISUALIZACAO">Visualização</option>
+        <option value="OPERACIONAL">Operacional</option>
+        <option value="FINANCEIRO">Financeiro</option>
+        <option value="SUPERVISAO">Supervisão</option>
+        <option value="DIRETOR">Diretor</option>
       </select>
     </div>
     <div class="modal-footer">
@@ -1127,22 +1139,26 @@ function _hideLoginOverlay(){
   if(ov)ov.classList.remove('visible');
 }
 
+const _CAN_UPLOAD=['DIRETOR','SUPERVISAO'];
+const _CAN_ADMIN=['DIRETOR'];
+const _ROLE_LABELS={DIRETOR:'Diretor',SUPERVISAO:'Supervisão',OPERACIONAL:'Operacional',FINANCEIRO:'Financeiro',VISUALIZACAO:'Visualização'};
+
 function _updateAuthUI(){
   const btnLogout=document.getElementById('btn-logout');
   const sideUser=document.getElementById('sidebar-user');
-  const isAdmin=_authRole==='ADMIN'&&_authToken;
-  const isGestor=(_authRole==='ADMIN'||_authRole==='GESTOR')&&_authToken;
+  const isAdmin=_CAN_ADMIN.includes(_authRole)&&_authToken;
+  const isGestor=_CAN_UPLOAD.includes(_authRole)&&_authToken;
   if(btnLogout)btnLogout.style.display=_authToken?'inline-block':'none';
   if(sideUser){
     sideUser.style.display=_authToken?'block':'none';
-    sideUser.textContent=_authLogin+' · '+_authRole;
+    sideUser.textContent=_authLogin+' · '+(_ROLE_LABELS[_authRole]||_authRole);
   }
-  // Admin: Usuários
+  // Diretor: Usuários
   const navGrpAdmin=document.getElementById('nav-group-admin');
   const navAdmin=document.getElementById('nav-admin');
   if(navGrpAdmin)navGrpAdmin.style.display=isAdmin?'':'none';
   if(navAdmin)navAdmin.style.display=isAdmin?'':'none';
-  // Admin+Gestor: Importar
+  // Diretor+Supervisão: Importar
   const navGrpImp=document.getElementById('nav-group-importar');
   const navImp=document.getElementById('nav-importar');
   if(navGrpImp)navGrpImp.style.display=isGestor?'':'none';
@@ -1270,21 +1286,30 @@ function _renderAdminUsers(){
   const el=document.getElementById('admin-users-body');
   if(!el)return;
   if(!_adminUsers.length){el.innerHTML='<div class="empty">Nenhum usuário cadastrado.</div>';return;}
-  const adminCount=_adminUsers.filter(u=>u.role==='ADMIN').length;
+  const diretorCount=_adminUsers.filter(u=>u.role==='DIRETOR').length;
   const rows=_adminUsers.map(u=>{
-    const canDel=!(u.role==='ADMIN'&&adminCount===1);
-    return`<tr>
-      <td style="font-weight:600">${u.login}</td>
-      <td><span class="user-role-badge role-${u.role}">${u.role}</span></td>
+    const isSelf=u.login===_authLogin;
+    const canDel=!isSelf&&!(u.role==='DIRETOR'&&diretorCount===1);
+    const atLabel=u.ativo?'Ativo':'Inativo';
+    const atClass=u.ativo?'sim':'nao';
+    const atBtnLabel=u.ativo?'Desativar':'Ativar';
+    const roleLabel=_ROLE_LABELS[u.role]||u.role;
+    return`<tr style="${u.ativo?'':'opacity:0.55'}">
+      <td style="font-weight:600">${u.nome||'—'}</td>
+      <td style="color:#555">${u.login}</td>
+      <td><span class="user-role-badge role-${u.role}">${roleLabel}</span></td>
+      <td><span class="badge-ativo ${atClass}">${atLabel}</span></td>
       <td style="color:${u.must_change_password?'#C48A00':'#22A05B'};font-size:11px">${u.must_change_password?'Pendente':'OK'}</td>
       <td style="white-space:nowrap">
         <button class="admin-tbl-btn" onclick="_openUserModal('${u.id}')">Editar</button>
-        ${canDel?`<button class="admin-tbl-btn del" style="margin-left:6px" onclick="_deleteUser('${u.id}','${u.login}')">Excluir</button>`:''}
+        ${!isSelf?`<button class="admin-tbl-btn" style="margin-left:4px" onclick="_toggleAtivo('${u.id}','${u.login}',${u.ativo})">${atBtnLabel}</button>`:''}
+        <button class="admin-tbl-btn" style="margin-left:4px" onclick="_resetSenha('${u.id}','${u.login}')">Reset Senha</button>
+        ${canDel?`<button class="admin-tbl-btn del" style="margin-left:4px" onclick="_deleteUser('${u.id}','${u.login}')">Excluir</button>`:''}
       </td>
     </tr>`;
   }).join('');
   el.innerHTML=`<div class="tscroll"><table>
-    <thead><tr><th>Login</th><th>Perfil</th><th>Senha</th><th>Ações</th></tr></thead>
+    <thead><tr><th>Nome</th><th>Login</th><th>Perfil</th><th>Status</th><th>Senha</th><th>Ações</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }
@@ -1295,14 +1320,16 @@ function _openUserModal(uid){
   const title=document.getElementById('user-modal-title');
   if(uid){
     const u=_adminUsers.find(x=>x.id===uid);
+    document.getElementById('umod-nome').value=u?u.nome:'';
     document.getElementById('umod-login').value=u?u.login:'';
-    document.getElementById('umod-role').value=u?u.role:'OPERACIONAL';
+    document.getElementById('umod-role').value=u?u.role:'VISUALIZACAO';
     document.getElementById('umod-pwd').value='';
     if(title)title.textContent='Editar Usuário';
     if(hint)hint.style.display='inline';
   }else{
+    document.getElementById('umod-nome').value='';
     document.getElementById('umod-login').value='';
-    document.getElementById('umod-role').value='OPERACIONAL';
+    document.getElementById('umod-role').value='VISUALIZACAO';
     document.getElementById('umod-pwd').value='';
     if(title)title.textContent='Novo Usuário';
     if(hint)hint.style.display='none';
@@ -1311,16 +1338,18 @@ function _openUserModal(uid){
 }
 
 async function _saveUser(){
-  const login=(document.getElementById('umod-login').value||'').trim();
+  const nome=(document.getElementById('umod-nome').value||'').trim();
+  const login=(document.getElementById('umod-login').value||'').trim().toLowerCase();
   const pwd=document.getElementById('umod-pwd').value||'';
   const role=document.getElementById('umod-role').value;
+  if(!nome){showToast('Informe o nome completo.','#CC0000');return;}
   if(!login){showToast('Informe o login.','#CC0000');return;}
   if(!_editingUserId&&!pwd){showToast('Informe a senha para o novo usuário.','#CC0000');return;}
-  if(!_editingUserId&&pwd.length<6){showToast('Senha deve ter ao menos 6 caracteres.','#CC0000');return;}
+  if(pwd&&pwd.length<6){showToast('Senha deve ter ao menos 6 caracteres.','#CC0000');return;}
   try{
     let resp;
     if(_editingUserId){
-      const body={login,role};
+      const body={nome,login,role};
       if(pwd)body.password=pwd;
       resp=await fetch(API_BASE+'/usuarios/'+_editingUserId,{
         method:'PUT',
@@ -1331,13 +1360,44 @@ async function _saveUser(){
       resp=await fetch(API_BASE+'/usuarios',{
         method:'POST',
         headers:{'Content-Type':'application/json',..._authHeaders()},
-        body:JSON.stringify({login,password:pwd,role})
+        body:JSON.stringify({nome,login,password:pwd,role})
       });
     }
     if(!resp.ok){const d=await resp.json();showToast(d.detail||'Erro ao salvar.','#CC0000');return;}
     document.getElementById('user-modal').classList.remove('open');
     showToast(_editingUserId?'Usuário atualizado.':'Usuário criado com sucesso.','#1A8C4E');
     await _loadAdminUsers();
+  }catch(e){
+    showToast('Erro de conexão.','#CC0000');
+  }
+}
+
+async function _toggleAtivo(uid,login,ativo){
+  const acao=ativo?'desativar':'ativar';
+  if(!confirm(`Confirma ${acao} o usuário "${login}"?`))return;
+  try{
+    const resp=await fetch(API_BASE+'/usuarios/'+uid+'/ativo',{method:'PATCH',headers:_authHeaders()});
+    if(!resp.ok){const d=await resp.json();showToast(d.detail||'Erro.','#CC0000');return;}
+    const d=await resp.json();
+    showToast(`Usuário "${login}" ${d.ativo?'ativado':'desativado'}.`,'#1A8C4E');
+    await _loadAdminUsers();
+  }catch(e){
+    showToast('Erro de conexão.','#CC0000');
+  }
+}
+
+async function _resetSenha(uid,login){
+  const nova=prompt(`Nova senha para "${login}" (mín. 6 caracteres):`);
+  if(!nova)return;
+  if(nova.length<6){showToast('Senha deve ter ao menos 6 caracteres.','#CC0000');return;}
+  try{
+    const resp=await fetch(API_BASE+'/usuarios/'+uid+'/reset-senha',{
+      method:'POST',
+      headers:{'Content-Type':'application/json',..._authHeaders()},
+      body:JSON.stringify({nova_senha:nova})
+    });
+    if(!resp.ok){const d=await resp.json();showToast(d.detail||'Erro.','#CC0000');return;}
+    showToast(`Senha de "${login}" redefinida. Usuário deverá trocar no próximo acesso.`,'#1A8C4E');
   }catch(e){
     showToast('Erro de conexão.','#CC0000');
   }
