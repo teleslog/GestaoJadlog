@@ -451,7 +451,7 @@ tr:hover td{background:#FFF5F5;}
           </div>
           <div class="modal-field">
             <label class="modal-label">Arquivo (.xlsx)</label>
-            <input type="file" id="up-file" accept=".xlsx" style="width:100%;border:1.5px dashed #DDD;border-radius:8px;padding:12px;font-size:12px;cursor:pointer;outline:none;">
+            <input type="file" id="up-file" accept=".xlsx,.zip" style="width:100%;border:1.5px dashed #DDD;border-radius:8px;padding:12px;font-size:12px;cursor:pointer;outline:none;">
           </div>
           <button class="login-btn" style="width:auto;padding:12px 32px;margin-top:4px" onclick="_doUpload()">Enviar Arquivo</button>
           <div id="up-msg" style="margin-top:14px;font-size:12px;min-height:18px"></div>
@@ -460,9 +460,9 @@ tr:hover td{background:#FFF5F5;}
           <div style="font-size:10px;font-weight:700;color:#555;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:16px">Como funciona</div>
           <div style="font-size:12px;color:#555;line-height:1.8">
             <p>1. Selecione o <strong>tipo</strong> (Operacional ou Financeiro)</p>
-            <p>2. Clique em <strong>Escolher arquivo</strong> e selecione o .xlsx exportado</p>
+            <p>2. Clique em <strong>Escolher arquivo</strong> e selecione o <strong>.xlsx</strong> ou <strong>.zip</strong> exportado</p>
             <p>3. Clique em <strong>Enviar Arquivo</strong></p>
-            <p style="margin-top:12px;color:#888">O sistema identifica automaticamente a operação pelo conteúdo do arquivo (GV, Itabira, JM ou Curvelo). Não é necessário selecionar a operação manualmente.</p>
+            <p style="margin-top:12px;color:#888">O sistema identifica automaticamente a operação pelo conteúdo do arquivo (GV, Itabira, JM ou Curvelo). Arquivos <strong>.zip</strong> são extraídos automaticamente — basta enviar o zip sem precisar extrair manualmente.</p>
           </div>
         </div>
       </div>
@@ -1361,7 +1361,8 @@ async function _doUpload(){
   const msg=document.getElementById('up-msg');
   if(!fileInput.files.length){msg.style.color='#CC0000';msg.textContent='Selecione um arquivo .xlsx.';return;}
   const file=fileInput.files[0];
-  if(!file.name.toLowerCase().endsWith('.xlsx')){msg.style.color='#CC0000';msg.textContent='Apenas arquivos .xlsx são aceitos.';return;}
+  const fext=file.name.toLowerCase();
+  if(!fext.endsWith('.xlsx')&&!fext.endsWith('.zip')){msg.style.color='#CC0000';msg.textContent='Apenas arquivos .xlsx ou .zip são aceitos.';return;}
   msg.style.color='#888';msg.textContent='Enviando...';
   try{
     const fd=new FormData();
@@ -1862,7 +1863,7 @@ function calcM(rows){
   // BASE EFETIVA = sem custódia (denominador real do SLA%)
   const baseEfetiva=Math.max(slaEntregue+vencidas+vencHoje,1);
   const sla=Math.min(slaEntregue/baseEfetiva*100,100);
-  const faltam=Math.max(baseEfetiva-slaEntregue,0);
+  const faltam=vencidas+vencHoje;
 
   // Proporções do arco (divididas por BASE SLA para preencher 100% do semicírculo)
   const baseVis=Math.max(baseSLA,1);

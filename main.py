@@ -4,10 +4,11 @@ Deploy: Railway / Render | PORT: auto (via $PORT env)
 
 Estrutura de dados:
   dados/
-    financeiro/   ← todos os xlsx financeiros (qualquer nome)
-    operacional/  ← todos os xlsx operacionais (qualquer nome)
+    financeiro/   ← arquivos .xlsx ou .zip financeiros (qualquer nome)
+    operacional/  ← arquivos .xlsx ou .zip operacionais (qualquer nome)
 
 O sistema identifica a operação automaticamente pelo CONTEÚDO do arquivo.
+Arquivos .zip são extraídos automaticamente; temporários são apagados após leitura.
 Não é necessário renomear arquivos nem criar subpastas.
 
 Endpoints públicos:
@@ -21,7 +22,7 @@ Endpoints autenticados:
   GET  /dados/operacional/{key}
 
 Endpoints ADMIN/GESTOR:
-  POST /upload/{tipo}/{key}   → salva xlsx na pasta correta
+  POST /upload/{tipo}   → salva .xlsx ou .zip na pasta correta
 
 Endpoints ADMIN:
   GET    /usuarios
@@ -31,9 +32,13 @@ Endpoints ADMIN:
 """
 
 import asyncio
+import io
 import logging
 import os
+import shutil
+import tempfile
 import uuid
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -195,6 +200,53 @@ def _find_xlsx_files(folder: Path) -> list[Path]:
     )
 
 
+def _extract_zips_to_temp(folder: Path) -> tuple[list[Path], str | None]:
+    """
+    Extrai todos os .xlsx encontrados dentro dos .zip da pasta para um
+    diretório temporário. Cada zip recebe um subdiretório próprio para evitar
+    colisões de nomes entre arquivos de zips diferentes.
+
+    Retorna (lista_de_paths_extraídos, caminho_do_tempdir).
+    Se não houver zips, retorna ([], None).
+    """
+    if not folder.exists():
+        return [], None
+    zip_files = sorted(
+        [f for f in folder.glob("*.zip") if f.is_file() and not f.name.startswith("~$")],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    if not zip_files:
+        return [], None
+
+    temp_dir = tempfile.mkdtemp(prefix="gestao_")
+    extracted: list[Path] = []
+
+    for zf_path in zip_files:
+        zip_mtime = zf_path.stat().st_mtime
+        sub_dir = Path(temp_dir) / zf_path.stem
+        sub_dir.mkdir(exist_ok=True)
+        try:
+            with zipfile.ZipFile(zf_path, "r") as zf:
+                for info in zf.infolist():
+                    basename = Path(info.filename).name
+                    if not basename.lower().endswith(".xlsx"):
+                        continue
+                    if basename.startswith("~$") or "__MACOSX" in info.filename:
+                        continue
+                    dest = sub_dir / basename
+                    dest.write_bytes(zf.read(info.filename))
+                    os.utime(dest, (zip_mtime, zip_mtime))
+                    extracted.append(dest)
+                    log.info(f"[zip] {zf_path.name} → {basename}")
+        except zipfile.BadZipFile:
+            log.error(f"[zip] {zf_path.name}: ZIP inválido ou corrompido")
+        except Exception as exc:
+            log.error(f"[zip] {zf_path.name}: {exc}")
+
+    return extracted, temp_dir
+
+
 def _detect_op_from_content(df: pd.DataFrame, header_idx: int) -> str | None:
     """
     Identifica a operação dominante analisando os VALORES das células.
@@ -235,23 +287,28 @@ def _find_header_idx(df: pd.DataFrame) -> int:
     return 0
 
 
-def _scan_folder(folder: Path) -> dict[str, Path]:
+def _scan_folder(folder: Path) -> tuple[dict[str, list[Path]], str | None]:
     """
-    Escaneia a pasta, detecta a operação de cada arquivo e retorna
-    {key: path_do_arquivo_mais_recente}.
+    Escaneia a pasta (xlsx diretos + xlsx dentro de zips), detecta a operação
+    de cada arquivo e retorna ({key: [paths do mais recente ao mais antigo]}, temp_dir_ou_None).
 
-    Regras:
-    - Ignora ~$ (temporários do Excel)
-    - Arquivos ordenados do mais recente ao mais antigo
-    - Primeiro arquivo que detectar cada operação vence (= mais recente)
-    - Detecção por conteúdo; fallback por nome do arquivo
+    Todos os arquivos de cada operação são coletados para permitir mesclagem
+    acumulativa por Codigo (total de remessas nunca diminui).
+    O chamador é responsável por limpar o temp_dir após consumir os paths.
     """
-    files = _find_xlsx_files(folder)
-    result: dict[str, Path] = {}
+    direct_files = _find_xlsx_files(folder)
+    extracted_files, temp_dir = _extract_zips_to_temp(folder)
 
-    for path in files:
+    # Combina e ordena por mtime (mais recente primeiro)
+    all_files: list[Path] = sorted(
+        direct_files + extracted_files,
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+
+    result: dict[str, list[Path]] = {}
+    for path in all_files:
         try:
-            # Lê apenas as primeiras 330 linhas para detecção (rápido)
             df = pd.read_excel(path, header=None, engine="openpyxl", nrows=330)
             header_idx = _find_header_idx(df)
 
@@ -266,16 +323,15 @@ def _scan_folder(folder: Path) -> dict[str, Path]:
                 log.warning(f"[scan] {folder.name}/{path.name} → operação não identificada, ignorado")
                 continue
 
-            if key in result:
-                log.info(f"[scan] {folder.name}/{path.name} → '{key}' ({method}) — já coberto por arquivo mais recente")
-            else:
-                result[key] = path
-                log.info(f"[scan] {folder.name}/{path.name} → '{key}' detectado por {method}")
+            if key not in result:
+                result[key] = []
+            result[key].append(path)
+            log.info(f"[scan] {folder.name}/{path.name} → '{key}' detectado por {method}")
 
         except Exception as exc:
             log.error(f"[scan] Erro ao ler {path.name}: {exc}")
 
-    return result
+    return result, temp_dir
 
 # ── LEITURA COMPLETA DO XLSX ───────────────────────────────────────────────────
 
@@ -311,6 +367,33 @@ def _read_xlsx(path: Path) -> list[dict]:
             rows.append(obj)
     return rows
 
+
+def _read_and_merge(paths: list[Path]) -> list[dict]:
+    """
+    Lê todos os arquivos e mescla por coluna 'Codigo'.
+    Processa do mais antigo ao mais recente: arquivo mais recente vence em conflitos.
+    Garante que o total de remessas nunca diminua entre atualizações — Codigos
+    que saem do relatório novo ainda ficam com o último status conhecido.
+    """
+    merged: dict[str, dict] = {}
+    _no_key = 0
+
+    for path in reversed(paths):  # mais antigo primeiro → mais recente sobrescreve
+        try:
+            rows = _read_xlsx(path)
+            for row in rows:
+                codigo = row.get("Codigo", "").strip()
+                if codigo:
+                    merged[codigo] = row
+                else:
+                    _no_key += 1
+                    merged[f"__nk_{_no_key}"] = row
+            log.info(f"[merge] {path.name}: {len(rows)} linhas lidas")
+        except Exception as exc:
+            log.error(f"[merge] {path.name}: {exc}")
+
+    return list(merged.values())
+
 # ── CACHE ──────────────────────────────────────────────────────────────────────
 
 # _cache[tipo][key] = {key, op, opIdx, tipo, atualizado, linhas, dados, arquivo, erro}
@@ -323,7 +406,7 @@ def _build_entry(tipo: str, key: str, path: Path | None, rows: list | None = Non
     base = {"key": key, "op": op_name, "opIdx": op_idx, "tipo": tipo}
     if erro or path is None:
         folder = "financeiro" if tipo == "financeiro" else "operacional"
-        msg = erro or f"Nenhum arquivo .xlsx identificado como '{key}' em dados/{folder}/"
+        msg = erro or f"Nenhum arquivo .xlsx/.zip identificado como '{key}' em dados/{folder}/"
         return {**base, "atualizado": None, "linhas": 0, "dados": [],
                 "arquivo": None, "erro": msg}
     return {
@@ -334,24 +417,24 @@ def _build_entry(tipo: str, key: str, path: Path | None, rows: list | None = Non
     }
 
 
-async def _refresh_from_path(tipo: str, key: str, path: Path | None) -> dict:
-    if path is None:
+async def _refresh_from_paths(tipo: str, key: str, paths: list[Path]) -> dict:
+    if not paths:
         return _build_entry(tipo, key, None)
     try:
-        rows = _read_xlsx(path)
-        log.info(f"[load] {tipo}/{key} ← {path.name} ({len(rows)} linhas)")
-        return _build_entry(tipo, key, path, rows)
+        rows = _read_and_merge(paths)
+        newest = paths[0]
+        log.info(f"[load] {tipo}/{key} — {len(paths)} arquivo(s) → {len(rows)} linhas mescladas")
+        return _build_entry(tipo, key, newest, rows)
     except Exception as exc:
-        log.error(f"[load] {tipo}/{key} ← {path.name}: {exc}")
-        return _build_entry(tipo, key, path, erro=str(exc))
+        log.error(f"[load] {tipo}/{key}: {exc}")
+        return _build_entry(tipo, key, paths[0], erro=str(exc))
 
 
 async def refresh_all():
-    """Escaneia as pastas, detecta operações e atualiza o cache."""
+    """Escaneia as pastas (xlsx e zip), detecta operações e atualiza o cache."""
     loop = asyncio.get_event_loop()
 
-    # Scan em executor para não bloquear o event loop (leitura parcial de arquivos)
-    fin_scan, op_scan = await asyncio.gather(
+    (fin_scan, fin_tmp), (op_scan, op_tmp) = await asyncio.gather(
         loop.run_in_executor(None, _scan_folder, FIN_DIR),
         loop.run_in_executor(None, _scan_folder, OP_DIR),
     )
@@ -360,7 +443,7 @@ async def refresh_all():
     pairs = [(t, k) for t in TIPOS for k in OPS]
 
     results = await asyncio.gather(
-        *[_refresh_from_path(t, k, scans[t].get(k)) for t, k in pairs],
+        *[_refresh_from_paths(t, k, scans[t].get(k, [])) for t, k in pairs],
         return_exceptions=True,
     )
 
@@ -374,6 +457,10 @@ async def refresh_all():
     async with _cache_lock:
         global _cache
         _cache = new_cache
+
+    # Limpa diretórios temporários após todas as leituras
+    for tmp in filter(None, [fin_tmp, op_tmp]):
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def _background_refresh():
@@ -564,16 +651,30 @@ async def upload_file(
     """
     if tipo not in TIPOS:
         raise HTTPException(404, f"Tipo inválido: '{tipo}'. Use: financeiro, operacional")
-    if not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(400, "Apenas arquivos .xlsx são aceitos")
+    fname_lower = file.filename.lower()
+    if not (fname_lower.endswith(".xlsx") or fname_lower.endswith(".zip")):
+        raise HTTPException(400, "Apenas arquivos .xlsx ou .zip são aceitos")
     if file.filename.startswith("~$"):
         raise HTTPException(400, "Arquivo temporário do Excel não aceito")
+
+    content = await file.read()
+
+    if fname_lower.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                xlsx_inside = [
+                    n for n in zf.namelist()
+                    if n.lower().endswith(".xlsx") and not Path(n).name.startswith("~$")
+                ]
+            if not xlsx_inside:
+                raise HTTPException(400, "O ZIP não contém nenhum arquivo .xlsx")
+            log.info(f"[upload] zip contém {len(xlsx_inside)} xlsx: {xlsx_inside}")
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "Arquivo ZIP inválido ou corrompido")
 
     folder = FIN_DIR if tipo == "financeiro" else OP_DIR
     folder.mkdir(parents=True, exist_ok=True)
     dest = folder / file.filename
-
-    content = await file.read()
     dest.write_bytes(content)
     log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)")
 
