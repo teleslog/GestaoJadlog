@@ -1748,41 +1748,23 @@ function parseOp(raw,opName,opIdx){
     }
   }
 
-  // 'Hist. ultimo ponto' indica o ponto físico atual na rede Jadlog, não necessariamente a
-  // operação dona da remessa (em trânsito pode estar em TC TECA MATRIZ, FL BH, PA PICKUP, etc.).
-  // Estratégia: identificar a operação DOMINANTE do arquivo (maior contagem de NomePonto
-  // reconhecido) e atribuir a ela todas as linhas — exceto as que explicitamente pertencem
-  // a outra operação conhecida (evita dupla contagem entre arquivos de ops distintas).
+  // Regra estrita: só conta remessa se Hist. ultimo ponto for exatamente a nossa operação.
+  // Pacotes em trânsito (TC TECA, FL BH, PA PICKUP, etc.) não estão sob nossa custódia
+  // operacional — excluí-los evita inflar custódia e outros cards.
+  // Fallback: se nenhuma linha tiver uma das 4 ops conhecidas (export antigo / single-op),
+  // inclui tudo que tiver Codigo (formato de arquivo de operação única).
   const _KNOWN_OPS=['CO GOV VALADARES 01','CO ITABIRA 01','CO JOAO MONLEVADE 01','CO CURVELO 02'];
   const _opName=opName.toUpperCase();
 
-  // Conta linhas por operação conhecida para determinar a dominante
-  const _opCnt={};
-  _KNOWN_OPS.forEach(op=>{_opCnt[op]=0;});
-  data.forEach(r=>{
-    const v=String(r['Hist. ultimo ponto']||'').trim().toUpperCase();
-    if(_KNOWN_OPS.includes(v))_opCnt[v]++;
-  });
-  const _maxCnt=Math.max(...Object.values(_opCnt));
-  const _isMultiOp=_maxCnt>0;
+  const _hasKnownOp=data.some(r=>_KNOWN_OPS.includes(String(r['Hist. ultimo ponto']||'').trim().toUpperCase()));
 
   let filtered;
-  if(!_isMultiOp){
+  if(!_hasKnownOp){
     // Arquivo sem coluna de operação reconhecível: fallback (single-op export)
     filtered=data.filter(r=>String(r['Codigo']||'').trim()!=='');
   } else {
-    const _dominant=Object.entries(_opCnt).sort((a,b)=>b[1]-a[1])[0][0];
-    if(_opName===_dominant){
-      // Operação dominante: inclui suas linhas + linhas em trânsito/pontos externos
-      // (qualquer ponto que NÃO seja uma das 4 operações conhecidas pertence a esta op)
-      filtered=data.filter(r=>{
-        const v=String(r['Hist. ultimo ponto']||'').trim().toUpperCase();
-        return v===_opName||!_KNOWN_OPS.includes(v);
-      });
-    } else {
-      // Operação não-dominante: apenas as linhas explicitamente deste ponto
-      filtered=data.filter(r=>String(r['Hist. ultimo ponto']||'').trim().toUpperCase()===_opName);
-    }
+    // Filtro estrito: apenas linhas cujo último ponto é EXATAMENTE esta operação
+    filtered=data.filter(r=>String(r['Hist. ultimo ponto']||'').trim().toUpperCase()===_opName);
   }
 
   const _sample=filtered[0]||{};
