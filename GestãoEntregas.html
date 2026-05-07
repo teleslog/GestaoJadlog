@@ -1933,18 +1933,21 @@ function calcM(rows){
 
   // ── POPULAÇÃO SLA DO DIA: ENTRADA + EM ROTA com prazo <= hoje ──
   const inSLA=r=>{const d=dDiff(r.Previsao);return d!==null&&d>=0;};
-  // Pendentes: toda ENTRADA e EM ROTA sem filtro de hora
+  // Pendentes: ENTRADA e EM ROTA
   const isPending=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
 
   // Vencidas: pendentes com prazo expirado (Dias > 0)
+  // Regra 10h não se aplica a vencidas — deadline já passou, devem ser entregues
   const vencidas=rows.filter(r=>{
     const d=dDiff(r.Previsao);
     return d!==null&&d>0&&isPending(r);
   }).length;
+
   // Vencem hoje: pendentes com prazo hoje (Dias = 0)
+  // Regra 10h: ENTRADA com DtEvento hoje >= 10h é excluída — operação tem até amanhã
   const vencHoje=rows.filter(r=>{
     const d=dDiff(r.Previsao);
-    return d!==null&&d===0&&isPending(r);
+    return d!==null&&d===0&&isPending(r)&&entradaCountsToday(r);
   }).length;
 
   // Entregues SLA: entregues HOJE da coorte SLA OU que vencem hoje e já estão entregues
@@ -1955,9 +1958,10 @@ function calcM(rows){
     (r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP')&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r))
   ).length;
 
-  // Custódias SLA: custody HOJE OU que vencem hoje e já estão em custódia
+  // Custódias SLA: apenas remessas com prazo HOJE em custódia (coorte do dia)
+  // Removida condição _isToday(DtEvento): evita inflar com pacotes de outros dias que entraram em custódia hoje
   const slaCustodia=rows.filter(r=>
-    r.Status==='CUSTODIA'&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r))
+    r.Status==='CUSTODIA'&&_venceHoje(r)
   ).length;
 
   // BASE SLA = população do dia (entregues hoje + custódia + pendentes)
@@ -2109,8 +2113,8 @@ function openSlaDrawer(type){
         const d=dDiff(r.Previsao);
         if(d===null)return false;
         if((r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP')&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r)))return true;
-        if(r.Status==='CUSTODIA'&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r)))return true;
-        if(isPending(r)&&d>=0)return true;
+        if(r.Status==='CUSTODIA'&&_venceHoje(r))return true;
+        if(isPending(r)&&d>=0&&entradaCountsToday(r))return true;
         return false;
       });
       title='Previsto Hoje';break;
@@ -2118,16 +2122,16 @@ function openSlaDrawer(type){
       filtered=rows.filter(r=>(r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP')&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r)));
       title='Entregues (SLA do Dia)';break;
     case'ocorr':
-      filtered=rows.filter(r=>r.Status==='CUSTODIA'&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r)));
-      title='Ocorrências (Custódia)';break;
+      filtered=rows.filter(r=>r.Status==='CUSTODIA'&&_venceHoje(r));
+      title='Ocorrências (Custódia SLA Dia)';break;
     case'venc':
       filtered=rows.filter(r=>{const d=dDiff(r.Previsao);return d!==null&&d>0&&isPending(r);});
       title='Vencidas';break;
     case'vhoje':
-      filtered=rows.filter(r=>_venceHoje(r)&&isPending(r));
+      filtered=rows.filter(r=>_venceHoje(r)&&isPending(r)&&entradaCountsToday(r));
       title='Vencem Hoje';break;
     case'falt':
-      filtered=rows.filter(r=>{const d=dDiff(r.Previsao);return d!==null&&d>=0&&isPending(r);});
+      filtered=rows.filter(r=>{const d=dDiff(r.Previsao);return d!==null&&d>=0&&isPending(r)&&entradaCountsToday(r);});
       title='Faltam (Pendentes no prazo)';break;
     default:return;
   }

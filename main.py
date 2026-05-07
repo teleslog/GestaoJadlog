@@ -39,6 +39,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -414,7 +415,9 @@ def _scan_folder(folder: Path) -> tuple[dict[str, list[Path]], str | None]:
     result: dict[str, list[Path]] = {}
     for path in all_files:
         try:
+            _t = time.perf_counter()
             df = pd.read_excel(path, header=None, engine="openpyxl", nrows=330)
+            log.info(f"[perf][scan] read_excel 330 rows {path.name}: {time.perf_counter()-_t:.2f}s")
             header_idx = _find_header_idx(df)
 
             key = _detect_op_from_content(df, header_idx)
@@ -457,19 +460,51 @@ def _fmt(val) -> str:
 
 
 def _read_xlsx(path: Path) -> list[dict]:
-    """Lê o xlsx completo (somente leitura) e retorna lista de dicts."""
-    df = pd.read_excel(path, header=None, engine="openpyxl")
+    """Lê o xlsx completo e retorna lista de dicts — conversão vetorizada (sem iterrows)."""
+    _t0 = time.perf_counter()
+    df = pd.read_excel(path, header=None, engine="openpyxl",
+                       engine_kwargs={"read_only": True, "data_only": True})
+    _t1 = time.perf_counter()
+    log.info(f"[perf][read_xlsx] read_excel FULL {path.name} ({len(df)} rows): {_t1-_t0:.2f}s")
+
     header_idx = _find_header_idx(df)
     headers = [str(v).strip() if pd.notna(v) else "" for v in df.iloc[header_idx]]
+    col_idx   = [j for j, h in enumerate(headers) if h]
+    col_names = [headers[j] for j in col_idx]
 
-    rows = []
-    for _, row in df.iloc[header_idx + 1:].iterrows():
-        if row.isna().all():
-            continue
-        obj = {headers[j]: _fmt(row.iloc[j])
-               for j in range(len(headers)) if headers[j]}
-        if any(obj.values()):
-            rows.append(obj)
+    _t2 = time.perf_counter()
+    data = df.iloc[header_idx + 1:].reset_index(drop=True)
+    data = data.dropna(how="all")                  # descarta linhas 100% vazias
+    data = data.iloc[:, col_idx].copy()
+    data.columns = col_names
+
+    # Converte coluna por coluna de forma vetorizada
+    for col in data.columns:
+        if pd.api.types.is_datetime64_any_dtype(data[col]):
+            has_time = (data[col].dt.hour.ne(0)
+                        | data[col].dt.minute.ne(0)
+                        | data[col].dt.second.ne(0))
+            data[col] = data[col].dt.strftime("%d/%m/%Y").where(
+                ~has_time, data[col].dt.strftime("%d/%m/%Y %H:%M:%S"))
+        elif data[col].dtype.kind == "f":
+            # floats inteiros → "123" em vez de "123.0"
+            int_mask = data[col].notna() & (data[col] % 1 == 0)
+            as_obj = data[col].astype(object)
+            as_obj[int_mask] = data[col][int_mask].apply(lambda v: str(int(v)))
+            as_obj[~int_mask & data[col].notna()] = (
+                data[col][~int_mask & data[col].notna()].astype(str))
+            as_obj[data[col].isna()] = ""
+            data[col] = as_obj
+        else:
+            data[col] = (data[col].fillna("")
+                                  .astype(str)
+                                  .str.strip()
+                                  .replace({"nan": "", "<NA>": "", "NaT": ""}))
+
+    rows = [r for r in data.to_dict("records") if any(v for v in r.values())]
+    _t3 = time.perf_counter()
+    log.info(f"[perf][read_xlsx] vectorized_fmt {path.name} ({len(rows)} data rows): {_t3-_t2:.2f}s")
+    log.info(f"[perf][read_xlsx] TOTAL {path.name}: {_t3-_t0:.2f}s")
     return rows
 
 
@@ -537,20 +572,25 @@ async def _refresh_from_paths(tipo: str, key: str, paths: list[Path]) -> dict:
 
 async def refresh_all():
     """Escaneia as pastas (xlsx e zip), detecta operações e atualiza o cache."""
+    _t_total = time.perf_counter()
     loop = asyncio.get_event_loop()
 
+    _t = time.perf_counter()
     (fin_scan, fin_tmp), (op_scan, op_tmp) = await asyncio.gather(
         loop.run_in_executor(None, _scan_folder, FIN_DIR),
         loop.run_in_executor(None, _scan_folder, OP_DIR),
     )
+    log.info(f"[perf][refresh] _scan_folder ambas pastas: {time.perf_counter()-_t:.2f}s")
 
     scans = {"financeiro": fin_scan, "operacional": op_scan}
     pairs = [(t, k) for t in TIPOS for k in OPS]
 
+    _t = time.perf_counter()
     results = await asyncio.gather(
         *[_refresh_from_paths(t, k, scans[t].get(k, [])) for t, k in pairs],
         return_exceptions=True,
     )
+    log.info(f"[perf][refresh] _refresh_from_paths todas ops: {time.perf_counter()-_t:.2f}s")
 
     new_cache: dict[str, dict[str, dict]] = {t: {} for t in TIPOS}
     for (tipo, key), result in zip(pairs, results):
@@ -566,6 +606,38 @@ async def refresh_all():
     # Limpa diretórios temporários após todas as leituras
     for tmp in filter(None, [fin_tmp, op_tmp]):
         shutil.rmtree(tmp, ignore_errors=True)
+
+    log.info(f"[perf][refresh] TOTAL refresh_all: {time.perf_counter()-_t_total:.2f}s")
+
+
+async def refresh_tipo(tipo: str):
+    """Após upload: re-escaneia e recarrega apenas o tipo afetado (financeiro ou operacional)."""
+    _t_total = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    folder = FIN_DIR if tipo == "financeiro" else OP_DIR
+
+    _t = time.perf_counter()
+    scan, tmp = await loop.run_in_executor(None, _scan_folder, folder)
+    log.info(f"[perf][refresh] _scan_folder {tipo}: {time.perf_counter()-_t:.2f}s")
+
+    _t = time.perf_counter()
+    results = await asyncio.gather(
+        *[_refresh_from_paths(tipo, k, scan.get(k, [])) for k in OPS],
+        return_exceptions=True,
+    )
+    log.info(f"[perf][refresh] _refresh_from_paths {tipo}: {time.perf_counter()-_t:.2f}s")
+
+    async with _cache_lock:
+        for key, result in zip(OPS, results):
+            if isinstance(result, Exception):
+                _cache[tipo][key] = _build_entry(tipo, key, None, erro=str(result))
+            else:
+                _cache[tipo][key] = result
+
+    if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    log.info(f"[perf][refresh] TOTAL refresh_tipo({tipo}): {time.perf_counter()-_t_total:.2f}s")
 
 
 async def _background_refresh():
@@ -846,15 +918,21 @@ async def upload_file(
     if file.filename.startswith("~$"):
         raise HTTPException(400, "Arquivo temporário do Excel não aceito")
 
+    _t_upload = time.perf_counter()
+
+    _t = time.perf_counter()
     content = await file.read()
+    log.info(f"[perf][upload] receber arquivo ({len(content)} bytes): {time.perf_counter()-_t:.3f}s")
 
     if fname_lower.endswith(".zip"):
         try:
+            _t = time.perf_counter()
             with zipfile.ZipFile(io.BytesIO(content)) as zf:
                 xlsx_inside = [
                     n for n in zf.namelist()
                     if n.lower().endswith(".xlsx") and not Path(n).name.startswith("~$")
                 ]
+            log.info(f"[perf][upload] inspecionar zip: {time.perf_counter()-_t:.3f}s")
             if not xlsx_inside:
                 raise HTTPException(400, "O ZIP não contém nenhum arquivo .xlsx")
             log.info(f"[upload] zip contém {len(xlsx_inside)} xlsx: {xlsx_inside}")
@@ -864,11 +942,16 @@ async def upload_file(
     folder = FIN_DIR if tipo == "financeiro" else OP_DIR
     folder.mkdir(parents=True, exist_ok=True)
     dest = folder / file.filename
+    _t = time.perf_counter()
     dest.write_bytes(content)
+    log.info(f"[perf][upload] gravar no disco: {time.perf_counter()-_t:.3f}s")
     log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)")
 
-    # Re-escaneia a pasta inteira para atualizar todas as operações
-    await refresh_all()
+    # Re-escaneia apenas o tipo enviado (financeiro ou operacional)
+    _t = time.perf_counter()
+    await refresh_tipo(tipo)
+    log.info(f"[perf][upload] refresh_tipo({tipo}) após upload: {time.perf_counter()-_t:.2f}s")
+    log.info(f"[perf][upload] TOTAL endpoint upload: {time.perf_counter()-_t_upload:.2f}s")
 
     # Retorna quais operações foram identificadas na pasta
     async with _cache_lock:
