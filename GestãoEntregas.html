@@ -1862,8 +1862,21 @@ function updatePeriodBanner(){
 // ── DATA ACCESS ──
 function getRows(){
   let rows;
-  if(currentOp==='all')rows=opMaps.flatMap(m=>Array.from(m.values()));
-  else rows=Array.from(opMaps[+currentOp].values());
+  if(currentOp==='all'){
+    // Deduplica por Codigo entre as 4 ops — mesmo pacote pode aparecer em
+    // múltiplos arquivos em fases distintas; mantém o de DtEvento mais recente.
+    const dedup=new Map();
+    opMaps.forEach(m=>m.forEach((row,codigo)=>{
+      const ex=dedup.get(codigo);
+      if(!ex){dedup.set(codigo,row);return;}
+      const dEx=parseDate(String(ex.DtEvento||'').substring(0,10));
+      const dNew=parseDate(String(row.DtEvento||'').substring(0,10));
+      if(dNew&&(!dEx||dNew>=dEx))dedup.set(codigo,row);
+    }));
+    rows=Array.from(dedup.values());
+  } else {
+    rows=Array.from(opMaps[+currentOp].values());
+  }
   return applyPeriodFilter(rows);
 }
 
