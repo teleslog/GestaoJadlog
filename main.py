@@ -65,11 +65,13 @@ JWT_EXPIRE_HOURS       = 12
 DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Jadlog2026")[:72]
 
 BASE_DIR  = Path(__file__).parent
-DADOS_DIR = BASE_DIR / "dados"
-FIN_DIR   = DADOS_DIR / "financeiro"
-OP_DIR    = DADOS_DIR / "operacional"
 DASHBOARD = BASE_DIR / "GestãoEntregas.html"
-DB_PATH   = Path(os.environ.get("DB_PATH", str(BASE_DIR / "users.db")))
+
+# Em produção: DATA_DIR=/data (Railway Volume). Em local: omitir → usa BASE_DIR.
+_DATA_ROOT = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
+FIN_DIR    = _DATA_ROOT / "dados" / "financeiro"
+OP_DIR     = _DATA_ROOT / "dados" / "operacional"
+DB_PATH    = Path(os.environ.get("DB_PATH", str(_DATA_ROOT / "users.db")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("api")
