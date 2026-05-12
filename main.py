@@ -329,11 +329,13 @@ def _extract_zips_to_temp(folder: Path) -> tuple[list[Path], str | None]:
 
     temp_dir = tempfile.mkdtemp(prefix="gestao_")
     extracted: list[Path] = []
+    _t_unzip_total = time.perf_counter()
 
     for zf_path in zip_files:
         zip_mtime = zf_path.stat().st_mtime
         sub_dir = Path(temp_dir) / zf_path.stem
         sub_dir.mkdir(exist_ok=True)
+        _t_zip = time.perf_counter()
         try:
             with zipfile.ZipFile(zf_path, "r") as zf:
                 for info in zf.infolist():
@@ -347,11 +349,13 @@ def _extract_zips_to_temp(folder: Path) -> tuple[list[Path], str | None]:
                     os.utime(dest, (zip_mtime, zip_mtime))
                     extracted.append(dest)
                     log.info(f"[zip] {zf_path.name} → {basename}")
+            log.info(f"[perf] unzip  {zf_path.name} ({zf_path.stat().st_size // 1024} KB): {time.perf_counter()-_t_zip:.2f}s")
         except zipfile.BadZipFile:
             log.error(f"[zip] {zf_path.name}: ZIP inválido ou corrompido")
         except Exception as exc:
             log.error(f"[zip] {zf_path.name}: {exc}")
 
+    log.info(f"[perf] unzip  TOTAL {len(zip_files)} arquivo(s): {time.perf_counter()-_t_unzip_total:.2f}s")
     return extracted, temp_dir
 
 
@@ -464,10 +468,12 @@ def _fmt(val) -> str:
 def _read_xlsx(path: Path) -> list[dict]:
     """Lê o xlsx completo e retorna lista de dicts — conversão vetorizada (sem iterrows)."""
     _t0 = time.perf_counter()
+    _kb = path.stat().st_size // 1024
+    log.info(f"[ctx]  read_xlsx  arquivo={path.name}  tamanho={_kb} KB")
     df = pd.read_excel(path, header=None, engine="openpyxl",
                        engine_kwargs={"read_only": True, "data_only": True})
     _t1 = time.perf_counter()
-    log.info(f"[perf][read_xlsx] read_excel FULL {path.name} ({len(df)} rows): {_t1-_t0:.2f}s")
+    log.info(f"[perf] read_xlsx  {path.name} ({len(df)} rows | {_kb} KB): {_t1-_t0:.2f}s")
 
     header_idx = _find_header_idx(df)
     headers = [str(v).strip() if pd.notna(v) else "" for v in df.iloc[header_idx]]
@@ -505,8 +511,8 @@ def _read_xlsx(path: Path) -> list[dict]:
 
     rows = [r for r in data.to_dict("records") if any(v for v in r.values())]
     _t3 = time.perf_counter()
-    log.info(f"[perf][read_xlsx] vectorized_fmt {path.name} ({len(rows)} data rows): {_t3-_t2:.2f}s")
-    log.info(f"[perf][read_xlsx] TOTAL {path.name}: {_t3-_t0:.2f}s")
+    log.info(f"[perf] process_rows  {path.name} ({len(rows)} linhas): {_t3-_t2:.2f}s")
+    log.info(f"[perf] read_xlsx+process_rows TOTAL  {path.name}: {_t3-_t0:.2f}s")
     return rows
 
 
@@ -620,14 +626,14 @@ async def refresh_tipo(tipo: str):
 
     _t = time.perf_counter()
     scan, tmp = await loop.run_in_executor(None, _scan_folder, folder)
-    log.info(f"[perf][refresh] _scan_folder {tipo}: {time.perf_counter()-_t:.2f}s")
+    log.info(f"[perf] refresh_{tipo}_scan: {time.perf_counter()-_t:.2f}s")
 
     _t = time.perf_counter()
     results = await asyncio.gather(
         *[_refresh_from_paths(tipo, k, scan.get(k, [])) for k in OPS],
         return_exceptions=True,
     )
-    log.info(f"[perf][refresh] _refresh_from_paths {tipo}: {time.perf_counter()-_t:.2f}s")
+    log.info(f"[perf] refresh_{tipo}_load: {time.perf_counter()-_t:.2f}s")
 
     async with _cache_lock:
         for key, result in zip(OPS, results):
@@ -639,7 +645,7 @@ async def refresh_tipo(tipo: str):
     if tmp:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    log.info(f"[perf][refresh] TOTAL refresh_tipo({tipo}): {time.perf_counter()-_t_total:.2f}s")
+    log.info(f"[perf] refresh_{tipo}_TOTAL: {time.perf_counter()-_t_total:.2f}s")
 
 
 async def _background_refresh():
@@ -924,7 +930,7 @@ async def upload_file(
 
     _t = time.perf_counter()
     content = await file.read()
-    log.info(f"[perf][upload] receber arquivo ({len(content)} bytes): {time.perf_counter()-_t:.3f}s")
+    log.info(f"[perf] http_receive  {file.filename} ({len(content)//1024} KB): {time.perf_counter()-_t:.3f}s")
 
     if fname_lower.endswith(".zip"):
         try:
@@ -934,7 +940,7 @@ async def upload_file(
                     n for n in zf.namelist()
                     if n.lower().endswith(".xlsx") and not Path(n).name.startswith("~$")
                 ]
-            log.info(f"[perf][upload] inspecionar zip: {time.perf_counter()-_t:.3f}s")
+            log.info(f"[perf] inspect_zip  {file.filename}: {time.perf_counter()-_t:.3f}s")
             if not xlsx_inside:
                 raise HTTPException(400, "O ZIP não contém nenhum arquivo .xlsx")
             log.info(f"[upload] zip contém {len(xlsx_inside)} xlsx: {xlsx_inside}")
@@ -946,14 +952,14 @@ async def upload_file(
     dest = folder / file.filename
     _t = time.perf_counter()
     dest.write_bytes(content)
-    log.info(f"[perf][upload] gravar no disco: {time.perf_counter()-_t:.3f}s")
+    log.info(f"[perf] save_to_disk  {file.filename} ({len(content)//1024} KB | tipo={tipo}): {time.perf_counter()-_t:.3f}s")
     log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)")
 
     # Re-escaneia apenas o tipo enviado (financeiro ou operacional)
     _t = time.perf_counter()
     await refresh_tipo(tipo)
-    log.info(f"[perf][upload] refresh_tipo({tipo}) após upload: {time.perf_counter()-_t:.2f}s")
-    log.info(f"[perf][upload] TOTAL endpoint upload: {time.perf_counter()-_t_upload:.2f}s")
+    log.info(f"[perf] refresh_all_TOTAL  tipo={tipo}: {time.perf_counter()-_t:.2f}s")
+    log.info(f"[perf] TOTAL_UPLOAD  {file.filename}: {time.perf_counter()-_t_upload:.2f}s")
 
     # Retorna quais operações foram identificadas na pasta
     async with _cache_lock:
