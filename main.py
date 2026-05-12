@@ -399,6 +399,44 @@ def _find_header_idx(df: pd.DataFrame) -> int:
     return 0
 
 
+def _detect_key_from_path(path: Path) -> str | None:
+    """Detecta a operação de um único arquivo (xlsx ou zip) sem escanear a pasta toda."""
+    xlsx_to_scan: Path | None = None
+    tmp_dir: str | None = None
+    try:
+        if path.suffix.lower() == ".zip":
+            tmp_dir = tempfile.mkdtemp(prefix="gestao_key_")
+            with zipfile.ZipFile(path, "r") as zf:
+                for info in zf.infolist():
+                    basename = Path(info.filename).name
+                    if (basename.lower().endswith(".xlsx")
+                            and not basename.startswith("~$")
+                            and "__MACOSX" not in info.filename):
+                        dest = Path(tmp_dir) / basename
+                        dest.write_bytes(zf.read(info.filename))
+                        xlsx_to_scan = dest
+                        break
+        else:
+            xlsx_to_scan = path
+
+        if xlsx_to_scan is None:
+            return _detect_op_from_filename(path.name)
+
+        df = pd.read_excel(xlsx_to_scan, header=None, engine="openpyxl", nrows=330)
+        header_idx = _find_header_idx(df)
+        key = _detect_op_from_content(df, header_idx)
+        if key is None:
+            key = _detect_op_from_filename(path.name)
+        return key
+
+    except Exception as exc:
+        log.warning(f"[upload] detect_key {path.name}: {exc}; tentando pelo nome")
+        return _detect_op_from_filename(path.name)
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _scan_folder(folder: Path) -> tuple[dict[str, list[Path]], str | None]:
     """
     Escaneia a pasta (xlsx diretos + xlsx dentro de zips), detecta a operação
@@ -646,6 +684,35 @@ async def refresh_tipo(tipo: str):
         shutil.rmtree(tmp, ignore_errors=True)
 
     log.info(f"[perf] refresh_{tipo}_TOTAL: {time.perf_counter()-_t_total:.2f}s")
+
+
+async def refresh_one(tipo: str, key: str):
+    """
+    Pós-upload cirúrgico: re-escaneia a pasta e recarrega APENAS _cache[tipo][key].
+    Não toca em outras keys nem no outro tipo.
+    Mais rápido que refresh_tipo porque não lê arquivos das outras 3 operações.
+    """
+    _t_total = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    folder = FIN_DIR if tipo == "financeiro" else OP_DIR
+
+    _t = time.perf_counter()
+    scan, tmp = await loop.run_in_executor(None, _scan_folder, folder)
+    log.info(f"[perf] refresh_one_scan  {tipo}: {time.perf_counter()-_t:.2f}s")
+
+    paths = scan.get(key, [])
+
+    _t = time.perf_counter()
+    entry = await _refresh_from_paths(tipo, key, paths)
+    log.info(f"[perf] refresh_one_load  {tipo}/{key}: {time.perf_counter()-_t:.2f}s")
+
+    async with _cache_lock:
+        _cache[tipo][key] = entry
+
+    if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    log.info(f"[perf] refresh_one  {tipo}/{key}: {time.perf_counter()-_t_total:.2f}s")
 
 
 async def _background_refresh():
@@ -955,9 +1022,17 @@ async def upload_file(
     log.info(f"[perf] save_to_disk  {file.filename} ({len(content)//1024} KB | tipo={tipo}): {time.perf_counter()-_t:.3f}s")
     log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)")
 
-    # Re-escaneia apenas o tipo enviado (financeiro ou operacional)
+    # Detecta a key do arquivo recém-salvo e atualiza só esse cache
+    loop = asyncio.get_event_loop()
+    detected_key = await loop.run_in_executor(None, _detect_key_from_path, dest)
+    log.info(f"[upload] {file.filename} → key detectada: {detected_key}")
+
     _t = time.perf_counter()
-    await refresh_tipo(tipo)
+    if detected_key:
+        await refresh_one(tipo, detected_key)
+    else:
+        log.warning(f"[upload] {file.filename}: key não detectada, fallback refresh_tipo completo")
+        await refresh_tipo(tipo)
     log.info(f"[perf] refresh_all_TOTAL  tipo={tipo}: {time.perf_counter()-_t:.2f}s")
     log.info(f"[perf] TOTAL_UPLOAD  {file.filename}: {time.perf_counter()-_t_upload:.2f}s")
 
