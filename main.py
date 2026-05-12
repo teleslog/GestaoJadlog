@@ -359,6 +359,26 @@ def _extract_zips_to_temp(folder: Path) -> tuple[list[Path], str | None]:
     return extracted, temp_dir
 
 
+def _extract_one_zip(zip_path: Path) -> tuple[Path | None, str | None]:
+    """Extrai o primeiro .xlsx de um único zip para dir temporário. Caller limpa tmp_dir."""
+    tmp_dir = tempfile.mkdtemp(prefix="gestao_inc_")
+    try:
+        zip_mtime = zip_path.stat().st_mtime
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                basename = Path(info.filename).name
+                if (basename.lower().endswith(".xlsx")
+                        and not basename.startswith("~$")
+                        and "__MACOSX" not in info.filename):
+                    dest = Path(tmp_dir) / basename
+                    dest.write_bytes(zf.read(info.filename))
+                    os.utime(dest, (zip_mtime, zip_mtime))
+                    return dest, tmp_dir
+    except Exception as exc:
+        log.error(f"[merge_incremental] extract {zip_path.name}: {exc}")
+    return None, tmp_dir
+
+
 def _detect_op_from_content(df: pd.DataFrame, header_idx: int) -> str | None:
     """
     Identifica a operação dominante analisando os VALORES das células.
@@ -501,6 +521,19 @@ def _fmt(val) -> str:
     if isinstance(val, float):
         return str(int(val)) if val == int(val) else str(val)
     return str(val).strip()
+
+
+def _parse_dt_evento(s: str) -> datetime | None:
+    """Parses 'dd/mm/yyyy' ou 'dd/mm/yyyy HH:MM:SS' para datetime, ou None."""
+    s = str(s).strip()
+    try:
+        if len(s) >= 19:
+            return datetime.strptime(s[:19], "%d/%m/%Y %H:%M:%S")
+        if len(s) >= 10:
+            return datetime.strptime(s[:10], "%d/%m/%Y")
+    except ValueError:
+        pass
+    return None
 
 
 def _read_xlsx(path: Path) -> list[dict]:
@@ -713,6 +746,84 @@ async def refresh_one(tipo: str, key: str):
         shutil.rmtree(tmp, ignore_errors=True)
 
     log.info(f"[perf] refresh_one  {tipo}/{key}: {time.perf_counter()-_t_total:.2f}s")
+
+
+async def merge_incremental(tipo: str, key: str, src_path: Path):
+    """
+    Pós-upload incremental: lê APENAS o arquivo recém-enviado e mescla
+    no cache[tipo][key] existente por Codigo.
+    Dedup: mantém o registro com 'Dt Evento' mais recente.
+    Tempo: ~3-5s constante, independente do histórico acumulado.
+    """
+    _t_total = time.perf_counter()
+    loop = asyncio.get_event_loop()
+
+    # Extrai xlsx do zip se necessário
+    tmp_dir = None
+    if src_path.suffix.lower() == ".zip":
+        xlsx_path, tmp_dir = await loop.run_in_executor(None, _extract_one_zip, src_path)
+    else:
+        xlsx_path = src_path
+
+    if xlsx_path is None:
+        log.warning(f"[merge_incremental] {src_path.name}: xlsx não encontrado, fallback refresh_one")
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        await refresh_one(tipo, key)
+        return
+
+    # Lê apenas o novo arquivo
+    _t = time.perf_counter()
+    new_rows = await loop.run_in_executor(None, _read_xlsx, xlsx_path)
+    log.info(f"[perf] merge_inc_read  {src_path.name} ({len(new_rows)} linhas): {time.perf_counter()-_t:.2f}s")
+
+    if tmp_dir:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Merge incremental no cache existente
+    _t = time.perf_counter()
+    async with _cache_lock:
+        existing_rows = (_cache.get(tipo, {}).get(key) or {}).get("dados") or []
+
+        merged: dict[str, dict] = {}
+        _nk = 0
+        for row in existing_rows:
+            codigo = str(row.get("Codigo", "")).strip()
+            if codigo:
+                merged[codigo] = row
+            else:
+                _nk += 1
+                merged[f"__nk_{_nk}"] = row
+
+        rows_novas = 0
+        rows_atualizadas = 0
+        for row in new_rows:
+            codigo = str(row.get("Codigo", "")).strip()
+            if not codigo:
+                _nk += 1
+                merged[f"__nk_{_nk}"] = row
+                rows_novas += 1
+                continue
+            ex = merged.get(codigo)
+            if ex is None:
+                merged[codigo] = row
+                rows_novas += 1
+            else:
+                dt_new = _parse_dt_evento(row.get("Dt Evento", ""))
+                dt_ex  = _parse_dt_evento(ex.get("Dt Evento", ""))
+                if dt_new is None or (dt_ex is not None and dt_ex > dt_new):
+                    pass  # mantém existente — evento mais recente no cache
+                else:
+                    merged[codigo] = row
+                    rows_atualizadas += 1
+
+        rows_total = len(merged)
+        _cache[tipo][key] = _build_entry(tipo, key, src_path, list(merged.values()))
+
+    log.info(f"[perf] merge_incremental  {tipo}/{key} "
+             f"(novas={rows_novas}, atualizadas={rows_atualizadas}, total_cache={rows_total}): "
+             f"{time.perf_counter()-_t:.2f}s")
+    log.info(f"[perf] merge_incremental TOTAL  {tipo}/{key}: {time.perf_counter()-_t_total:.2f}s")
 
 
 async def _background_refresh():
@@ -1029,7 +1140,7 @@ async def upload_file(
 
     _t = time.perf_counter()
     if detected_key:
-        await refresh_one(tipo, detected_key)
+        await merge_incremental(tipo, detected_key, dest)
     else:
         log.warning(f"[upload] {file.filename}: key não detectada, fallback refresh_tipo completo")
         await refresh_tipo(tipo)
