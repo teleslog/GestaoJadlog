@@ -826,6 +826,7 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
 
         rows_novas = 0
         rows_atualizadas = 0
+        new_codes: set[str] = set()
         for row in new_rows:
             codigo = str(row.get("Codigo", "")).strip()
             if not codigo:
@@ -836,6 +837,7 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
             ex = merged.get(codigo)
             if ex is None:
                 merged[codigo] = row
+                new_codes.add(codigo)
                 rows_novas += 1
             else:
                 dt_new = _parse_dt_evento(row.get("Dt Evento", ""))
@@ -862,6 +864,16 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                 new_pe = _parse_dt_evento(pe_str)
                 if new_pe and existing_pe and new_pe < existing_pe:
                     merged[codigo]["__primeira_entrada"] = pe_str
+
+        # Proxy PE para novos códigos sem __primeira_entrada após nova_pe:
+        # remessas que chegaram hoje como EM ROTA (sem ENTRADA visível no snapshot)
+        # usam Dt Evento como melhor aproximação disponível para a regra das 10h.
+        # Aplica APENAS a códigos novos — existentes no cache (entraram antes) ficam intactos.
+        for codigo in new_codes:
+            if not merged[codigo].get("__primeira_entrada", ""):
+                dt_ev = _parse_dt_evento(str(merged[codigo].get("Dt Evento", "")))
+                if dt_ev:
+                    merged[codigo]["__primeira_entrada"] = dt_ev.strftime("%d/%m/%Y %H:%M:%S")
 
         rows_total = len(merged)
         _cache[tipo][key] = _build_entry(tipo, key, src_path, list(merged.values()))
