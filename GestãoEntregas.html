@@ -2235,14 +2235,16 @@ function dcTrav(r){
 let _currentEntrDrawer='';
 function _entrNome(r){return(r.Rota||r.Entr||'').trim()||'Sem entregador';}
 
-// Resumo SLA por entregador — usa mesma lógica centralizada (entraNoSlaHoje)
-// Considera apenas remessas com prazo HOJE (d===0) e válidas pela regra das 10h
+// Resumo SLA por entregador — mesma base do openEntrDrawer:
+// baseHoje (d=0 + entraNoSlaHoje) + baseVencPend (d>0, pendentes)
+// PREVISTO = vencidas reais + vencendo hoje reais (base completa, sem limite visual)
 function calcEntregadorSummary(rows){
-  const _venceHoje=r=>dDiff(r.Previsao)===0;
   const isEnt=r=>r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP';
   const isCust=r=>r.Status==='CUSTODIA';
   const isPend=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
-  const base=rows.filter(r=>entraNoSlaHoje(r)&&_venceHoje(r)&&(isEnt(r)||isCust(r)||isPend(r)));
+  const baseHoje=rows.filter(r=>entraNoSlaHoje(r)&&dDiff(r.Previsao)===0&&(isEnt(r)||isCust(r)||isPend(r)));
+  const baseVencPend=rows.filter(r=>dDiff(r.Previsao)>0&&isPend(r));
+  const base=[...baseHoje,...baseVencPend];
   _entrDetailRows=base;
   const sumMap={};
   base.forEach(r=>{
