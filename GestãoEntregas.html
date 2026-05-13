@@ -2274,8 +2274,18 @@ function openEntrDrawer(entr){
   _currentEntrDrawer=entr;
   const summary=calcEntregadorSummary(dashRows).find(s=>s.entr===entr);
   if(!summary)return;
-  // Somente remessas que afetam SLA: entraNoSlaHoje + previsão hoje ou vencida
-  const slaRows=dashRows.filter(r=>_entrNome(r)===entr&&entraNoSlaHoje(r)&&dDiff(r.Previsao)<=0);
+  // Somente remessas que afetam SLA:
+  // d>0 = vencidas (sem regra 10h, per SYSTEM_DOC 3.2)
+  // d=0 = vence hoje (aplica entraNoSlaHoje)
+  // d<0 = futuro → excluir
+  const slaRows=dashRows.filter(r=>{
+    if(_entrNome(r)!==entr)return false;
+    const d=dDiff(r.Previsao);
+    if(d===null)return false;
+    if(d>0)return true;
+    if(d===0)return entraNoSlaHoje(r);
+    return false;
+  });
   const isEnt=r=>r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP';
   const isCust=r=>r.Status==='CUSTODIA';
   const isPend=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
@@ -2314,7 +2324,7 @@ function openEntrDrawer(entr){
   const diasNormal=r=>dc(r.Dias,r.Status);
   document.getElementById('entr-sections').innerHTML=[
     sec('Vencendo Hoje','#CC0000',slaRows.filter(r=>dDiff(r.Previsao)===0&&isPend(r)),diasNormal),
-    sec('Vencidas','#880000',slaRows.filter(r=>dDiff(r.Previsao)<0&&isPend(r)),diasNormal),
+    sec('Vencidas','#880000',slaRows.filter(r=>dDiff(r.Previsao)>0&&isPend(r)),diasNormal),
     sec('Entregues','#22A05B',slaRows.filter(isEnt),diasNormal),
     sec('Custódia','#8B6FE8',slaRows.filter(isCust),diasNormal),
     sec('Travadas','#CC0000',slaRows.filter(isTrav),r=>dcTrav(r)),
@@ -2329,10 +2339,17 @@ function closeEntrDrawer(){
 function exportEntrDrawerCurrent(){
   if(!_currentEntrDrawer)return;
   const summary=calcEntregadorSummary(dashRows).find(s=>s.entr===_currentEntrDrawer);
-  // Exporta somente remessas que afetam SLA: entraNoSlaHoje + previsão hoje ou vencida
-  const slaRows=dashRows.filter(r=>_entrNome(r)===_currentEntrDrawer&&entraNoSlaHoje(r)&&dDiff(r.Previsao)<=0);
+  // Exporta somente remessas que afetam SLA (mesma lógica do drawer)
+  const slaRows=dashRows.filter(r=>{
+    if(_entrNome(r)!==_currentEntrDrawer)return false;
+    const d=dDiff(r.Previsao);
+    if(d===null)return false;
+    if(d>0)return true;
+    if(d===0)return entraNoSlaHoje(r);
+    return false;
+  });
   const out=slaRows.map(r=>({
-    'Tipo SLA':dDiff(r.Previsao)<0?'Vencida':'Vence Hoje',
+    'Tipo SLA':dDiff(r.Previsao)>0?'Vencida':'Vence Hoje',
     'Código':r.Codigo,'Cidade':r.Cidade,'Bairro':r.Bairro,'Destinatário':r.Dest||'',
     'Status':r.Status,'Dt Evento':r.DtEvento,'Previsão':r.Previsao,
     'Entregador/Rota':_currentEntrDrawer,'Dias':r.Dias,
