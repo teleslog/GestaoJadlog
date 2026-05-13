@@ -615,6 +615,7 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
     Garante que o total de remessas nunca diminua entre atualizações — Codigos
     que saem do relatório novo ainda ficam com o último status conhecido.
     Injeta '__primeira_entrada' (regra das 10h): menor DtEvento com Status=ENTRADA por Codigo.
+    Proxy: códigos sem ENTRADA usam menor Dt Evento histórico como aproximação.
     """
     merged: dict[str, dict] = {}
     all_rows_for_pe: list[dict] = []
@@ -635,10 +636,29 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
         except Exception as exc:
             log.error(f"[merge] {path.name}: {exc}")
 
+    # Injeta PE a partir de eventos ENTRADA (mais preciso)
     pe_map = _compute_primeira_entrada(all_rows_for_pe)
     for codigo, pe_str in pe_map.items():
         if codigo in merged:
             merged[codigo]["__primeira_entrada"] = pe_str
+
+    # Proxy PE: para códigos sem __primeira_entrada, usa o menor Dt Evento histórico.
+    # Cobre remessas que nunca aparecem como ENTRADA em nenhum snapshot (ex: EM ROTA
+    # desde a primeira captura). Sem isso, PE ficaria '' e o fallback de entraNoSlaHoje
+    # incluiria incorretamente remessas que entraram hoje após 10h.
+    earliest: dict[str, datetime] = {}
+    for row in all_rows_for_pe:
+        codigo = str(row.get("Codigo", "")).strip()
+        if not codigo:
+            continue
+        dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
+        if dt is None:
+            continue
+        if codigo not in earliest or dt < earliest[codigo]:
+            earliest[codigo] = dt
+    for codigo, dt in earliest.items():
+        if codigo in merged and not merged[codigo].get("__primeira_entrada", ""):
+            merged[codigo]["__primeira_entrada"] = dt.strftime("%d/%m/%Y %H:%M:%S")
 
     return list(merged.values())
 
@@ -1121,6 +1141,59 @@ async def get_dados(
     if entry is None:
         raise HTTPException(503, f"Dados de {tipo}/{key} ainda não carregados")
     return JSONResponse(entry)
+
+
+@app.get("/diag/sla")
+async def diag_sla(codigos: str, admin: User = Depends(_require_admin)):
+    """Diagnóstico da regra das 10h para códigos específicos (CSV). Ex: /diag/sla?codigos=123,456"""
+    from datetime import date as _date
+    target = {c.strip() for c in codigos.split(",") if c.strip()}
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    result = []
+    async with _cache_lock:
+        for tipo in TIPOS:
+            for key, entry in _cache.get(tipo, {}).items():
+                for row in (entry.get("dados") or []):
+                    cod = str(row.get("Codigo", "")).strip()
+                    if cod not in target:
+                        continue
+                    pe = str(row.get("__primeira_entrada", ""))
+                    previsao = str(row.get("Previsao", ""))
+                    dt_ev = str(row.get("Dt Evento", ""))
+                    # Recalcula entraNoSlaHoje
+                    entra = True
+                    pe_reason = "PE vazia → fallback true"
+                    if pe:
+                        d = _parse_dt_evento(pe[:10])
+                        if d:
+                            if d.date() < today.date():
+                                pe_reason = f"PE {pe[:10]} < hoje → inclui"
+                            elif d.date() > today.date():
+                                pe_reason = f"PE {pe[:10]} > hoje → inclui"
+                            else:
+                                hh = int(pe[11:13]) if len(pe) >= 13 else -1
+                                if hh < 0:
+                                    pe_reason = "PE hoje sem hora → fallback true"
+                                elif hh < 10:
+                                    pe_reason = f"PE hoje {pe[11:16]} < 10h → inclui"
+                                else:
+                                    entra = False
+                                    pe_reason = f"PE hoje {pe[11:16]} >= 10h → EXCLUI"
+                    # dDiff previsao
+                    dp = _parse_dt_evento(previsao[:10])
+                    ddiff = (today.date() - dp.date()).days if dp else None
+                    result.append({
+                        "codigo": cod, "tipo": tipo, "key": key,
+                        "status": row.get("Status", ""),
+                        "previsao": previsao, "ddiff": ddiff,
+                        "dt_evento": dt_ev,
+                        "primeira_entrada": pe or "(vazio)",
+                        "entraNoSlaHoje": entra,
+                        "motivo": pe_reason,
+                    })
+    not_found = target - {r["codigo"] for r in result}
+    return {"ts": datetime.now().isoformat(timespec="seconds"), "diagnostico": result,
+            "nao_encontrados": list(not_found)}
 
 
 @app.get("/status")
