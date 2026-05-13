@@ -118,7 +118,8 @@ body{background:var(--bg);font-family:'Segoe UI',sans-serif;color:var(--text);di
 table{width:100%;border-collapse:collapse;font-size:11px;min-width:650px;}
 th{color:#888;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:8px 12px;text-align:left;border-bottom:1px solid #EEEEEE;position:sticky;top:0;background:white;white-space:nowrap;cursor:pointer;user-select:none;}
 th:hover{color:#CC0000;}
-td{color:#1A1A1A;font-size:13px;padding:5px 12px;border-bottom:1px solid #F0F0F0;white-space:nowrap;}
+td{color:#1A1A1A;font-size:13px;padding:5px 8px;border-bottom:1px solid #F0F0F0;white-space:nowrap;}
+.td-ell{overflow:hidden;text-overflow:ellipsis;}
 tr:hover td{background:#FFF5F5;}
 .badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;border-radius:20px;color:white;}
 .bENTREGUE,.bENTREGUENOPICKUP{background:#22A05B;}
@@ -555,14 +556,20 @@ tr:hover td{background:#FFF5F5;}
             <div class="pill active" onclick="setDF('TODOS',this)">Todos</div>
             <div class="pill" onclick="setDF('EM ROTA',this)">Em Rota</div>
             <div class="pill" onclick="setDF('ENTRADA',this)">Entrada</div>
+            <div class="pill" onclick="setDF('__entr__',this)">Entregador</div>
             <div class="pill" onclick="setDF('CUSTODIA',this)">Custódia</div>
             <div class="pill" onclick="setDF('TRAVADO',this)">Travado</div>
             <button class="xbtn" onclick="exportDash()">⬇ Excel</button>
           </div>
         </div>
-        <div class="tscroll"><table><thead><tr>
-          <th>Código</th><th>Cidade</th><th>Bairro</th><th>Destinatário</th><th>Status</th><th>Dt Evento</th><th>Previsão</th><th>Rota</th><th>Dias</th>
-        </tr></thead><tbody id="dash-tb"></tbody></table></div>
+        <div class="tscroll">
+          <table id="dash-table-main"><thead><tr>
+            <th style="width:115px">Código</th><th style="max-width:95px">Cidade</th><th style="max-width:85px">Bairro</th><th style="max-width:105px">Destinatário</th><th style="width:98px">Status</th><th style="width:110px">Dt Evento</th><th style="width:72px">Previsão</th><th style="max-width:78px">Rota</th><th style="width:65px">Dias</th>
+          </tr></thead><tbody id="dash-tb"></tbody></table>
+          <table id="dash-table-entr" style="display:none"><thead><tr>
+            <th>Entregador</th><th style="width:100px;text-align:right">Previsto Hoje</th><th style="width:85px;text-align:right">Entregues</th><th style="width:70px;text-align:right">Faltam</th><th style="width:65px;text-align:right">SLA%</th>
+          </tr></thead><tbody id="dash-tb-entr"></tbody></table>
+        </div>
         <div class="tfooter"><span id="dash-cnt">0</span><span>máx 300 linhas — use filtros ou exporte</span></div>
       </div>
     </div>
@@ -2169,24 +2176,105 @@ function dc(d,status){
 
 // ── DASH TABLE ──
 let dashRows=[];
-function renderDashTable(rows){dashRows=rows;dashFilter='TODOS';
+let _entrDetailRows=[]; // remessas base do painel entregador (para export)
+
+// Dias que a remessa está travada = dDiff(DtEvento), ignora Previsao
+function dcTrav(r){
+  const d=dDiff(r.DtEvento);
+  if(d===null)return'—';
+  if(d===0)return'<span class="da">hoje</span>';
+  return`<span class="dr">${d}d</span>`;
+}
+
+// Resumo SLA por entregador — usa mesma lógica centralizada (entraNoSlaHoje)
+// Considera apenas remessas com prazo HOJE (d===0) e válidas pela regra das 10h
+function calcEntregadorSummary(rows){
+  const _venceHoje=r=>dDiff(r.Previsao)===0;
+  const isEnt=r=>r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP';
+  const isCust=r=>r.Status==='CUSTODIA';
+  const isPend=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
+  const base=rows.filter(r=>entraNoSlaHoje(r)&&_venceHoje(r)&&(isEnt(r)||isCust(r)||isPend(r)));
+  _entrDetailRows=base;
+  const sumMap={};
+  base.forEach(r=>{
+    const k=r.Entr||'—';
+    if(!sumMap[k])sumMap[k]={entr:k,previsto:0,entregues:0,faltam:0,custodia:0};
+    sumMap[k].previsto++;
+    if(isEnt(r))sumMap[k].entregues++;
+    else if(isCust(r))sumMap[k].custodia++;
+    else sumMap[k].faltam++;
+  });
+  return Object.values(sumMap)
+    .map(s=>({...s,sla:s.previsto>0?Math.round(s.entregues/s.previsto*100):100}))
+    .sort((a,b)=>a.sla-b.sla||b.faltam-a.faltam);
+}
+
+function renderDashTable(rows){
+  dashRows=rows;
+  if(dashFilter==='__entr__'){filterDash();return;} // mantém modo entregador no refresh
+  dashFilter='TODOS';
   document.querySelectorAll('#page-dashboard .pill').forEach(p=>p.classList.remove('active'));
   document.querySelector('#page-dashboard .pill')?.classList.add('active');
-  filterDash();}
+  filterDash();
+}
 function setDF(f,el){dashFilter=f;document.querySelectorAll('#page-dashboard .pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');filterDash();}
 function filterDash(){
   const q=(document.getElementById('dash-q').value||'').toLowerCase();
+  const mMain=document.getElementById('dash-table-main');
+  const mEntr=document.getElementById('dash-table-entr');
+  if(dashFilter==='__entr__'){
+    if(mMain)mMain.style.display='none';
+    if(mEntr)mEntr.style.display='';
+    const summary=calcEntregadorSummary(dashRows);
+    const filtered=q?summary.filter(s=>s.entr.toLowerCase().includes(q)):summary;
+    document.getElementById('dash-tb-entr').innerHTML=filtered.map(s=>{
+      const col=s.sla>=90?'#22A05B':s.sla>=70?'#E5A100':'#CC0000';
+      return`<tr>
+        <td style="font-weight:600">${s.entr}</td>
+        <td style="text-align:right">${s.previsto}</td>
+        <td style="text-align:right;color:#22A05B;font-weight:700">${s.entregues}</td>
+        <td style="text-align:right;color:${s.faltam>0?'#CC0000':'#888'};font-weight:${s.faltam>0?700:400}">${s.faltam}</td>
+        <td style="text-align:right;color:${col};font-weight:700">${s.sla}%</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('dash-cnt').textContent=filtered.length+' entregadores — '+_entrDetailRows.length+' remessas no SLA';
+    return;
+  }
+  if(mMain)mMain.style.display='';
+  if(mEntr)mEntr.style.display='none';
   let rows=dashFilter==='TODOS'?dashRows:dashRows.filter(r=>dashFilter.split(',').includes(r.Status));
   if(q)rows=rows.filter(r=>(r.Codigo+r.Cidade+r.Bairro+(r.Dest||'')+r.Rota).toLowerCase().includes(q));
   document.getElementById('dash-tb').innerHTML=rows.slice(0,300).map(r=>`<tr>
-    <td class="td-codigo" data-codigo="${r.Codigo}" onclick="openCodeHistory(this.dataset.codigo)">${r.Codigo}</td><td>${r.Cidade}</td><td>${r.Bairro}</td>
-    <td>${r.Dest||''}</td>
+    <td class="td-codigo" data-codigo="${r.Codigo}" onclick="openCodeHistory(this.dataset.codigo)">${r.Codigo}</td>
+    <td class="td-ell" style="max-width:95px" title="${r.Cidade}">${r.Cidade}</td>
+    <td class="td-ell" style="max-width:85px" title="${r.Bairro}">${r.Bairro}</td>
+    <td class="td-ell" style="max-width:105px" title="${r.Dest||''}">${r.Dest||''}</td>
     <td><span class="badge ${bc(r.Status)}">${r.Status}</span></td>
-    <td>${r.DtEvento}</td><td>${r.Previsao}</td><td>${r.Rota}</td><td>${dc(r.Dias,r.Status)}</td>
+    <td>${r.DtEvento}</td><td>${r.Previsao}</td>
+    <td class="td-ell" style="max-width:78px" title="${r.Rota}">${r.Rota}</td>
+    <td>${dc(r.Dias,r.Status)}</td>
   </tr>`).join('');
   document.getElementById('dash-cnt').textContent=rows.length+' registros';
 }
 function exportDash(){
+  if(dashFilter==='__entr__'){
+    const summary=calcEntregadorSummary(dashRows);
+    const stats={};summary.forEach(s=>{stats[s.entr]=s;});
+    const out=_entrDetailRows.map(r=>{
+      const s=stats[r.Entr||'—']||{previsto:0,entregues:0,faltam:0,sla:0};
+      return{
+        'Código':r.Codigo,'Cidade':r.Cidade,'Bairro':r.Bairro,'Destinatário':r.Dest||'',
+        'Status':r.Status,'Dt Evento':r.DtEvento,'Previsão':r.Previsao,
+        'Entregador':r.Entr||'','Rota':r.Rota,
+        'SLA Entregador (%)':s.sla,'Previsto Hoje Entregador':s.previsto,
+        'Entregues Entregador':s.entregues,'Faltam Entregador':s.faltam
+      };
+    });
+    const ws=XLSX.utils.json_to_sheet(out),wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,'SLA Entregador');
+    XLSX.writeFile(wb,`SLA_Entregador_${new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')}.xlsx`);
+    return;
+  }
   const q=(document.getElementById('dash-q').value||'').toLowerCase();
   let rows=dashFilter==='TODOS'?dashRows:dashRows.filter(r=>dashFilter.split(',').includes(r.Status));
   if(q)rows=rows.filter(r=>(r.Codigo+r.Cidade+r.Bairro+(r.Dest||'')+r.Rota).toLowerCase().includes(q));
@@ -2252,7 +2340,7 @@ function renderOp(type){
   }else{
     tb.innerHTML=f.slice(0,300).map(r=>`<tr>
       <td class="td-codigo" data-codigo="${r.Codigo}" onclick="openCodeHistory(this.dataset.codigo)">${r.Codigo}</td><td>${r.Cidade}</td><td>${r.Bairro}</td>
-      <td>${r.Rota}</td><td>${r.DtEvento}</td><td>${r.Previsao}</td><td>${dc(r.Dias,r.Status)}</td></tr>`).join('');
+      <td>${r.Rota}</td><td>${r.DtEvento}</td><td>${r.Previsao}</td><td>${dcTrav(r)}</td></tr>`).join('');
   }
   document.getElementById(type+'-cnt').textContent=f.length+' registros';
 }
