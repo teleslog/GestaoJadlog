@@ -1144,7 +1144,7 @@ async def get_dados(
 
 
 @app.get("/diag/sla")
-async def diag_sla(codigos: str, admin: User = Depends(_require_admin)):
+async def diag_sla(codigos: str, admin: User = Depends(_require_gestor)):
     """Diagnóstico da regra das 10h para códigos específicos (CSV). Ex: /diag/sla?codigos=123,456"""
     from datetime import date as _date
     target = {c.strip() for c in codigos.split(",") if c.strip()}
