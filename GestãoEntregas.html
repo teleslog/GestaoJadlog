@@ -271,8 +271,8 @@ tr:hover td{background:#FFF5F5;}
 .risco-crit{background:#FFEBEE;color:#CC0000;}
 
 /* ENTREGADOR DRAWER */
-.entr-drawer{position:fixed;top:0;right:-760px;width:760px;height:100vh;background:white;border-left:1px solid #DDD;z-index:102;display:flex;flex-direction:column;transition:right 0.3s cubic-bezier(0.4,0,0.2,1);}
-.entr-drawer.open{right:0;}
+.entr-drawer{position:fixed;top:3vh;left:50%;transform:translateX(-50%) translateY(20px);width:min(96vw,1360px);height:94vh;background:white;border-radius:12px;box-shadow:0 12px 60px rgba(0,0,0,0.3);z-index:102;display:flex;flex-direction:column;opacity:0;pointer-events:none;transition:opacity 0.25s,transform 0.25s;}
+.entr-drawer.open{opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0);}
 .entr-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:0;padding:18px 24px;border-bottom:1px solid #EEE;flex-shrink:0;}
 .entr-stat{padding:0 12px;}
 .entr-stat:first-child{padding-left:0;}
@@ -981,7 +981,10 @@ tr:hover td{background:#FFF5F5;}
       <div class="drawer-title" id="entr-drawer-name">—</div>
       <div style="color:rgba(255,255,255,0.6);font-size:11px;margin-top:3px" id="entr-drawer-risco"></div>
     </div>
-    <button class="drawer-close" onclick="closeEntrDrawer()">✕ Fechar</button>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="xbtn" onclick="exportEntrDrawerCurrent()" style="background:rgba(255,255,255,0.15);border-color:rgba(255,255,255,0.4);color:white;font-size:11px">⬇ Excel</button>
+      <button class="drawer-close" onclick="closeEntrDrawer()">✕ Fechar</button>
+    </div>
   </div>
   <div class="entr-stats" id="entr-stats"></div>
   <div class="entr-prog" id="entr-prog"></div>
@@ -2228,6 +2231,10 @@ function dcTrav(r){
   return`<span class="dr">${d}d</span>`;
 }
 
+// Retorna o nome operacional do entregador: Rota (col 11) tem prioridade sobre Hist. ultimo operador
+let _currentEntrDrawer='';
+function _entrNome(r){return(r.Rota||r.Entr||'').trim()||'Sem entregador';}
+
 // Resumo SLA por entregador — usa mesma lógica centralizada (entraNoSlaHoje)
 // Considera apenas remessas com prazo HOJE (d===0) e válidas pela regra das 10h
 function calcEntregadorSummary(rows){
@@ -2239,7 +2246,7 @@ function calcEntregadorSummary(rows){
   _entrDetailRows=base;
   const sumMap={};
   base.forEach(r=>{
-    const k=r.Entr||'Sem entregador';
+    const k=_entrNome(r);
     if(!sumMap[k])sumMap[k]={entr:k,previsto:0,entregues:0,faltam:0,custodia:0};
     sumMap[k].previsto++;
     if(isEnt(r))sumMap[k].entregues++;
@@ -2264,10 +2271,11 @@ function riscoHtml(s){
   return`<span class="risco-badge risco-${r}">${labels[r]}</span>`;
 }
 function openEntrDrawer(entr){
+  _currentEntrDrawer=entr;
   const summary=calcEntregadorSummary(dashRows).find(s=>s.entr===entr);
   if(!summary)return;
-  const allForEntr=dashRows.filter(r=>(r.Entr||'Sem entregador')===entr);
-  const slaForEntr=_entrDetailRows.filter(r=>(r.Entr||'Sem entregador')===entr);
+  // Somente remessas que afetam SLA: entraNoSlaHoje + previsão hoje ou vencida
+  const slaRows=dashRows.filter(r=>_entrNome(r)===entr&&entraNoSlaHoje(r)&&dDiff(r.Previsao)<=0);
   const isEnt=r=>r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP';
   const isCust=r=>r.Status==='CUSTODIA';
   const isPend=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
@@ -2305,11 +2313,11 @@ function openEntrDrawer(entr){
   };
   const diasNormal=r=>dc(r.Dias,r.Status);
   document.getElementById('entr-sections').innerHTML=[
-    sec('Vencendo Hoje','#CC0000',slaForEntr.filter(isPend),diasNormal),
-    sec('Em Rota','#E5A100',allForEntr.filter(r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'),diasNormal),
-    sec('Entregues','#22A05B',allForEntr.filter(isEnt),diasNormal),
-    sec('Custódia','#8B6FE8',allForEntr.filter(isCust),diasNormal),
-    sec('Travadas','#CC0000',allForEntr.filter(isTrav),r=>dcTrav(r)),
+    sec('Vencendo Hoje','#CC0000',slaRows.filter(r=>dDiff(r.Previsao)===0&&isPend(r)),diasNormal),
+    sec('Vencidas','#880000',slaRows.filter(r=>dDiff(r.Previsao)<0&&isPend(r)),diasNormal),
+    sec('Entregues','#22A05B',slaRows.filter(isEnt),diasNormal),
+    sec('Custódia','#8B6FE8',slaRows.filter(isCust),diasNormal),
+    sec('Travadas','#CC0000',slaRows.filter(isTrav),r=>dcTrav(r)),
   ].join('');
   document.getElementById('entr-dov').classList.add('open');
   document.getElementById('entr-drawer').classList.add('open');
@@ -2317,6 +2325,29 @@ function openEntrDrawer(entr){
 function closeEntrDrawer(){
   document.getElementById('entr-dov').classList.remove('open');
   document.getElementById('entr-drawer').classList.remove('open');
+}
+function exportEntrDrawerCurrent(){
+  if(!_currentEntrDrawer)return;
+  const summary=calcEntregadorSummary(dashRows).find(s=>s.entr===_currentEntrDrawer);
+  // Exporta somente remessas que afetam SLA: entraNoSlaHoje + previsão hoje ou vencida
+  const slaRows=dashRows.filter(r=>_entrNome(r)===_currentEntrDrawer&&entraNoSlaHoje(r)&&dDiff(r.Previsao)<=0);
+  const out=slaRows.map(r=>({
+    'Tipo SLA':dDiff(r.Previsao)<0?'Vencida':'Vence Hoje',
+    'Código':r.Codigo,'Cidade':r.Cidade,'Bairro':r.Bairro,'Destinatário':r.Dest||'',
+    'Status':r.Status,'Dt Evento':r.DtEvento,'Previsão':r.Previsao,
+    'Entregador/Rota':_currentEntrDrawer,'Dias':r.Dias,
+  }));
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(out.length?out:[{'Tipo SLA':'Sem remessas SLA'}]),'Remessas SLA');
+  if(summary){
+    const risco={ok:'OK',aten:'Atenção',crit:'Crítico'}[calcRisco(summary)]||'—';
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([{
+      'Entregador':_currentEntrDrawer,'SLA%':summary.sla,'Previsto':summary.previsto,
+      'Entregues':summary.entregues,'Faltam':summary.faltam,'Custódia':summary.custodia,'Risco':risco
+    }]),'Resumo');
+  }
+  const safeName=_currentEntrDrawer.replace(/[^a-zA-Z0-9 ]/g,'_').replace(/\s+/g,'_');
+  XLSX.writeFile(wb,`Entregador_${safeName}_${new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')}.xlsx`);
 }
 
 function renderDashTable(rows){
@@ -2373,7 +2404,7 @@ function exportDash(){
     const summary=calcEntregadorSummary(dashRows);
     const stats={};summary.forEach(s=>{stats[s.entr]=s;});
     const out=_entrDetailRows.map(r=>{
-      const s=stats[r.Entr||'Sem entregador']||{previsto:0,entregues:0,faltam:0,sla:0};
+      const s=stats[_entrNome(r)]||{previsto:0,entregues:0,faltam:0,sla:0};
       return{
         'Código':r.Codigo,'Cidade':r.Cidade,'Bairro':r.Bairro,'Destinatário':r.Dest||'',
         'Status':r.Status,'Dt Evento':r.DtEvento,'Previsão':r.Previsao,
