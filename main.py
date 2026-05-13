@@ -536,6 +536,27 @@ def _parse_dt_evento(s: str) -> datetime | None:
     return None
 
 
+def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
+    """
+    Varre uma lista de linhas brutas do xlsx (formato log de eventos) e retorna
+    {codigo: 'dd/mm/yyyy HH:MM:SS'} com o MENOR DtEvento onde Status='ENTRADA'.
+    Usado para preencher '__primeira_entrada' — base da regra das 10h no frontend.
+    """
+    primeira: dict[str, datetime] = {}
+    for row in rows:
+        codigo = str(row.get("Codigo", "")).strip()
+        if not codigo:
+            continue
+        if str(row.get("Status", "")).strip().upper() != "ENTRADA":
+            continue
+        dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
+        if dt is None:
+            continue
+        if codigo not in primeira or dt < primeira[codigo]:
+            primeira[codigo] = dt
+    return {c: dt.strftime("%d/%m/%Y %H:%M:%S") for c, dt in primeira.items()}
+
+
 def _read_xlsx(path: Path) -> list[dict]:
     """Lê o xlsx completo e retorna lista de dicts — conversão vetorizada (sem iterrows)."""
     _t0 = time.perf_counter()
@@ -593,13 +614,16 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
     Processa do mais antigo ao mais recente: arquivo mais recente vence em conflitos.
     Garante que o total de remessas nunca diminua entre atualizações — Codigos
     que saem do relatório novo ainda ficam com o último status conhecido.
+    Injeta '__primeira_entrada' (regra das 10h): menor DtEvento com Status=ENTRADA por Codigo.
     """
     merged: dict[str, dict] = {}
+    all_rows_for_pe: list[dict] = []
     _no_key = 0
 
     for path in reversed(paths):  # mais antigo primeiro → mais recente sobrescreve
         try:
             rows = _read_xlsx(path)
+            all_rows_for_pe.extend(rows)
             for row in rows:
                 codigo = row.get("Codigo", "").strip()
                 if codigo:
@@ -610,6 +634,11 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
             log.info(f"[merge] {path.name}: {len(rows)} linhas lidas")
         except Exception as exc:
             log.error(f"[merge] {path.name}: {exc}")
+
+    pe_map = _compute_primeira_entrada(all_rows_for_pe)
+    for codigo, pe_str in pe_map.items():
+        if codigo in merged:
+            merged[codigo]["__primeira_entrada"] = pe_str
 
     return list(merged.values())
 
@@ -814,8 +843,25 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                 if dt_new is None or (dt_ex is not None and dt_ex > dt_new):
                     pass  # mantém existente — evento mais recente no cache
                 else:
+                    pe_old = ex.get("__primeira_entrada", "")  # preserva antes de sobrescrever
                     merged[codigo] = row
+                    if pe_old:
+                        merged[codigo]["__primeira_entrada"] = pe_old
                     rows_atualizadas += 1
+
+        # Injeta/atualiza __primeira_entrada com dados do novo arquivo (regra das 10h)
+        nova_pe = _compute_primeira_entrada(new_rows)
+        for codigo, pe_str in nova_pe.items():
+            if codigo not in merged:
+                continue
+            existing_pe_str = merged[codigo].get("__primeira_entrada", "")
+            if not existing_pe_str:
+                merged[codigo]["__primeira_entrada"] = pe_str
+            else:
+                existing_pe = _parse_dt_evento(existing_pe_str)
+                new_pe = _parse_dt_evento(pe_str)
+                if new_pe and existing_pe and new_pe < existing_pe:
+                    merged[codigo]["__primeira_entrada"] = pe_str
 
         rows_total = len(merged)
         _cache[tipo][key] = _build_entry(tipo, key, src_path, list(merged.values()))
