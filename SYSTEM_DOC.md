@@ -2,7 +2,7 @@
 
 > **Fonte da verdade do sistema.** Este documento descreve a arquitetura, regras de negócio, lógica crítica e convenções do GestãoEntregas. Deve ser atualizado a cada mudança estrutural relevante.
 
-**Versão do documento:** 2026-05-13  
+**Versão do documento:** 2026-05-13 (rev2)  
 **Repositório:** https://github.com/teleslog/GestaoJadlog.git (branch `main`)  
 **Deploy:** https://web-production-1614e.up.railway.app  
 **Diretório local:** `C:\Users\André\Downloads\cloud_api\`
@@ -334,7 +334,11 @@ Exibido na pill **Entregador** da tabela Remessas do Dashboard.
 
 Ordenação: menor SLA primeiro, depois mais faltam.
 
-Entregador sem nome no arquivo exibe **"Sem entregador"**.
+O nome do entregador é resolvido por `_entrNome(r)` = `(r.Rota || r.Entr || '').trim() || 'Sem entregador'`.
+
+> **Por que Rota tem prioridade:** `Hist. ultimo operador` (`r.Entr`) foi encontrado vazio em 100% das linhas do GV (diagnóstico 2026-05-13). A coluna `Rota` (índice 11) é o campo operacional confiável para identificação do entregador/rota.
+
+Remessas sem Rota e sem Hist. ultimo operador exibem **"Sem entregador"** — casos legítimos incluem status TRANSFERENCIA, EMISSAO e ENTRADA (sem rota atribuída ainda).
 
 ### 4.2 RISCO Operacional (`calcRisco`)
 
@@ -364,50 +368,70 @@ function calcRisco(s) {
 
 ### 4.3 Drawer do Entregador (`openEntrDrawer`)
 
-Painel lateral (760px) ativado ao clicar em uma linha da tabela Entregador.
+Modal fullscreen (96vw × 94vh) ativado ao clicar em uma linha da tabela Entregador. Centrado na tela com animação fade+slide e border-radius.
 
-#### Estrutura do drawer
+> **Visão operacional de ação imediata:** o painel lista APENAS remessas que afetam o SLA (`entraNoSlaHoje(r) && dDiff(r.Previsao) <= 0`). Remessas futuras ou fora do coorte SLA não aparecem.
+
+#### Estrutura do modal
 
 ```
-┌─────────────────────────────────────────────────┐
-│ [Nome do Entregador]               [🔴 Crítico]  │ ← header vermelho
-│                                    [✕ Fechar]   │
-├─────────────────────────────────────────────────┤
-│ PREVISTO │ ENTREGUES │ FALTAM │ CUSTÓDIA │ SLA%  │ ← stats grid (5 cols)
-├─────────────────────────────────────────────────┤
-│ PROGRESSO SLA  ████░░░░░░░░  141 de 456         │ ← barra de progresso
-├─────────────────────────────────────────────────┤
-│ VENCENDO HOJE (N remessas)                      │ ← seção: pendentes coorte SLA
-│  Código | Cidade | Bairro | Dest. | Status | ... │
-├─────────────────────────────────────────────────┤
-│ EM ROTA (N remessas)                            │ ← seção: todos em rota
-├─────────────────────────────────────────────────┤
-│ ENTREGUES (N remessas)                          │
-├─────────────────────────────────────────────────┤
-│ CUSTÓDIA (N remessas)                           │
-├─────────────────────────────────────────────────┤
-│ TRAVADAS (N remessas)                           │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ [Nome do Entregador]   [🔴 Crítico]  [⬇ Excel] [✕ Fechar]│ ← header vermelho
+├──────────────────────────────────────────────────────────┤
+│ PREVISTO │ ENTREGUES │ FALTAM │ CUSTÓDIA │ SLA%           │ ← stats grid (5 cols)
+├──────────────────────────────────────────────────────────┤
+│ PROGRESSO SLA  ████░░░░░░  141 de 456                    │ ← barra de progresso
+├──────────────────────────────────────────────────────────┤
+│ VENCENDO HOJE (N remessas)                               │ ← d=0, pendentes, SLA
+│  Código | Cidade | Bairro | Dest. | Status | ...         │
+├──────────────────────────────────────────────────────────┤
+│ VENCIDAS (N remessas)                                    │ ← d<0, pendentes, SLA
+├──────────────────────────────────────────────────────────┤
+│ ENTREGUES (N remessas)                                   │ ← entregues dentro SLA
+├──────────────────────────────────────────────────────────┤
+│ CUSTÓDIA (N remessas)                                    │ ← custódia dentro SLA
+├──────────────────────────────────────────────────────────┤
+│ TRAVADAS (N remessas)                                    │ ← travadas dentro SLA
+└──────────────────────────────────────────────────────────┘
+```
+
+#### Filtro base (`slaRows`)
+
+```javascript
+// Todas as seções são derivadas de slaRows — sem acesso a remessas fora do SLA
+const slaRows = dashRows.filter(r =>
+    _entrNome(r) === entr &&
+    entraNoSlaHoje(r) &&
+    dDiff(r.Previsao) <= 0
+);
 ```
 
 #### Fonte de dados por seção
 
-| Seção          | Fonte              | Filtro                                      |
-|----------------|--------------------|---------------------------------------------|
-| Vencendo Hoje  | `_entrDetailRows`  | Status pendente (coorte SLA do dia)          |
-| Em Rota        | `dashRows`         | Status = EM ROTA ou EM ROTA PICKUP           |
-| Entregues      | `dashRows`         | Status = ENTREGUE ou ENTREGUE NO PICKUP      |
-| Custódia       | `dashRows`         | Status = CUSTODIA                            |
-| Travadas       | `dashRows`         | Status = TRAVADO (usa `dcTrav` para Dias)    |
+| Seção          | Filtro sobre `slaRows`                          | Função Dias     |
+|----------------|--------------------------------------------------|-----------------|
+| Vencendo Hoje  | `dDiff(r.Previsao) === 0 && isPend(r)`           | `dc(r.Dias, r.Status)` |
+| Vencidas       | `dDiff(r.Previsao) < 0 && isPend(r)`             | `dc(r.Dias, r.Status)` |
+| Entregues      | `isEnt(r)` (ENTREGUE ou ENTREGUE NO PICKUP)      | `dc(r.Dias, r.Status)` |
+| Custódia       | `isCust(r)` (CUSTODIA)                           | `dc(r.Dias, r.Status)` |
+| Travadas       | `isTrav(r)` (TRAVADO)                            | `dcTrav(r)` (DtEvento) |
 
-> **Nota:** "Vencendo Hoje" e "Em Rota" podem ter overlap intencional — uma remessa EM ROTA com prazo hoje aparece em ambas, pois servem propósitos distintos (urgência do dia vs. visão geral da rota).
+#### Export Excel do painel (`exportEntrDrawerCurrent`)
+
+Botão **⬇ Excel** no cabeçalho do modal. Exporta somente remessas SLA do entregador aberto.
+
+- Aba **Remessas SLA**: todas as `slaRows` com colunas:
+  `Tipo SLA | Código | Cidade | Bairro | Destinatário | Status | Dt Evento | Previsão | Entregador/Rota | Dias`
+- Coluna **Tipo SLA**: `"Vencida"` (d<0) ou `"Vence Hoje"` (d=0)
+- Aba **Resumo**: uma linha com `Entregador | SLA% | Previsto | Entregues | Faltam | Custódia | Risco`
+- Arquivo: `Entregador_{nome}_{data}.xlsx`
 
 #### Campos exibidos nas tabelas do drawer
 
 `Código | Cidade | Bairro | Destinatário | Status | Dt Evento | Previsão | Dias`
 
 - Código é clicável → abre histórico da remessa (`openCodeHistory`)
-- Tabelas têm scroll horizontal para resolução menor (notebook-safe)
+- Tabelas têm scroll horizontal (notebook-safe)
 - Seções vazias são ocultadas automaticamente
 
 ---
@@ -427,8 +451,8 @@ Colunas raw do arquivo exportado do sistema Jadlog:
 | `Status`                  | `r.Status`          | Status atual (uppercased)                      |
 | `Dt Evento`               | `r.DtEvento`        | Data/hora do último evento (`DD/MM/YYYY HH:MM:SS`) |
 | `Previsao`                | `r.Previsao`        | Prazo de entrega (`DD/MM/YYYY`)                |
-| `Rota`                    | `r.Rota`            | Código de rota                                 |
-| `Hist. ultimo operador`   | `r.Entr`            | Nome do entregador (normalizado com `cap()`)   |
+| `Rota`                    | `r.Rota`            | Rota/entregador — **campo primário** para `_entrNome()` |
+| `Hist. ultimo operador`   | `r.Entr`            | Nome do operador — fallback em `_entrNome()` (frequentemente vazio) |
 | `Hist. ultimo ponto`      | (filtro parseOp)    | Torre operacional — usado para filtrar remessas|
 | `Hist. ultima descricao`  | `r.Desc`            | Descrição do último evento                     |
 | `__primeira_entrada`      | `r.PrimeiraEntrada` | Injetado pelo backend — ver seção 3.3          |
@@ -516,6 +540,7 @@ bcrypt direto (sem passlib). Historicamente, passlib causou corrupção de hashe
 
 Nunca duplicar:
 - `entraNoSlaHoje(row)` — regra das 10h
+- `_entrNome(r)` — nome do entregador operacional (`r.Rota||r.Entr||'Sem entregador'`)
 - `dDiff(s)` — cálculo de dias
 - `parseDate(s)` — parse de datas
 - `bc(status)` — classe CSS do badge de status
@@ -563,7 +588,8 @@ O placeholder `{{APP_VERSION}}` no HTML é substituído no startup e exibido no 
 
 Resolução mínima testada: **1280×768** (notebook).
 
-Drawers laterais (SLA e Entregador) devem ter no máximo 760px de largura. Tabelas internas de drawers usam `overflow-x: auto` para evitar conteúdo cortado.
+- **Drawer SLA** (`#drawer`): painel lateral, max 760px. Tabelas internas com `overflow-x: auto`.
+- **Modal Entregador** (`#entr-drawer`): modal fullscreen centrado, `min(96vw, 1360px) × 94vh`. Funciona bem de notebook a widescreen.
 
 ---
 
@@ -577,9 +603,9 @@ Drawers laterais (SLA e Entregador) devem ter no máximo 760px de largura. Tabel
 | Auto-refresh          | `startAutoRefresh()` + `fetchAll()`      | Dashboard para de atualizar    |
 | Merge incremental     | `merge_incremental()` em main.py         | Upload volta a 49s+            |
 | Cache never-shrinks   | `mergeOp()` no frontend                  | Remessas "somem" do dashboard  |
-| Export Excel          | `exportDash()`, `exportOp()`, `exportDrawer()` | Equipe perde ferramenta de trabalho |
+| Export Excel          | `exportDash()`, `exportOp()`, `exportDrawer()`, `exportEntrDrawerCurrent()` | Equipe perde ferramenta de trabalho |
 | Drawer SLA (`#drawer`)| `openSlaDrawer()`, `openDrawerWithRows()` | Cards do gauge param de funcionar |
-| Aba Entregador        | `calcEntregadorSummary()`, `filterDash()` | Visão por entregador some      |
+| Aba Entregador        | `calcEntregadorSummary()`, `filterDash()`, `_entrNome()` | Visão por entregador some |
 | `PrimeiraEntrada` protect | `mergeOp()` preserva prevPE         | Regra das 10h falha no frontend |
 
 ### 8.2 Antes de qualquer alteração em SLA
@@ -606,11 +632,12 @@ calcEntregadorSummary() → base de cálculo do resumo
 
 ### 8.5 Sempre validar após mudança
 
-- [ ] Sem `console.error` na aba Entregador e no drawer
+- [ ] Sem `console.error` na aba Entregador e no modal
 - [ ] Auto-refresh preserva o modo ativo da pill
-- [ ] Overlay dos drawers fecha corretamente
-- [ ] Export Excel funciona em todos os modos (TODOS, filtros, Entregador)
-- [ ] Drawer SLA original ainda abre e fecha
+- [ ] Overlay do drawer SLA e overlay do modal entregador fecham corretamente
+- [ ] Export Excel funciona em todos os modos (TODOS, filtros, Aba Entregador, Modal Entregador)
+- [ ] Drawer SLA original (`#drawer`) ainda abre e fecha
+- [ ] Modal Entregador mostra somente remessas SLA (sem remessas futuras)
 - [ ] Layout sem quebras em 1280×768
 
 ---
@@ -680,12 +707,13 @@ calcM(rows):
 
 Biblioteca: `xlsx.js` (SheetJS CDN).
 
-| Modo         | Arquivo gerado                    | Conteúdo                                    |
-|--------------|-----------------------------------|---------------------------------------------|
-| Dashboard TODOS/filtro | `Dashboard_DD-MM-AAAA.xlsx` | Remessas filtradas visíveis                |
-| Entregador   | `SLA_Entregador_DD-MM-AAAA.xlsx`  | `_entrDetailRows` + stats por entregador    |
-| Drawers SLA  | `SLA_{tipo}_DD-MM-AAAA.xlsx`      | Remessas do drawer com todos os campos      |
-| Páginas Op   | `{Status}_DD-MM-AAAA.xlsx`        | Em Rota / Entrada / Custódia / Travadas     |
+| Modo                   | Arquivo gerado                          | Conteúdo                                            |
+|------------------------|-----------------------------------------|-----------------------------------------------------|
+| Dashboard TODOS/filtro | `Dashboard_DD-MM-AAAA.xlsx`             | Remessas filtradas visíveis                         |
+| Aba Entregador (geral) | `SLA_Entregador_DD-MM-AAAA.xlsx`        | `_entrDetailRows` + stats por entregador (todos)    |
+| Modal Entregador       | `Entregador_{nome}_DD-MM-AAAA.xlsx`     | Apenas remessas SLA do entregador aberto + resumo   |
+| Drawers SLA            | `SLA_{tipo}_DD-MM-AAAA.xlsx`            | Remessas do drawer com todos os campos              |
+| Páginas Op             | `{Status}_DD-MM-AAAA.xlsx`              | Em Rota / Entrada / Custódia / Travadas             |
 
 ### 9.6 Refresh Automático (frontend)
 
@@ -792,4 +820,4 @@ fetchAll(showLoading):
 ---
 
 *Documento mantido por: André Teles / equipe de desenvolvimento*  
-*Última atualização: 2026-05-13 — commit `ba18aa3`*
+*Última atualização: 2026-05-13 (rev2) — commit `423d7f7`*
