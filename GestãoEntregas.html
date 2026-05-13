@@ -263,6 +263,33 @@ tr:hover td{background:#FFF5F5;}
 .admin-tbl-btn:hover{border-color:#CC0000;color:#CC0000;}
 .admin-tbl-btn.del{color:#CC0000;}
 .admin-tbl-btn.del:hover{background:#FFEBEE;border-color:#CC0000;}
+
+/* RISCO BADGES */
+.risco-badge{display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:700;padding:2px 8px;border-radius:12px;white-space:nowrap;}
+.risco-ok{background:#E8F5E9;color:#1A8C4E;}
+.risco-aten{background:#FFF8E1;color:#C48A00;}
+.risco-crit{background:#FFEBEE;color:#CC0000;}
+
+/* ENTREGADOR DRAWER */
+.entr-drawer{position:fixed;top:0;right:-760px;width:760px;height:100vh;background:white;border-left:1px solid #DDD;z-index:102;display:flex;flex-direction:column;transition:right 0.3s cubic-bezier(0.4,0,0.2,1);}
+.entr-drawer.open{right:0;}
+.entr-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:0;padding:18px 24px;border-bottom:1px solid #EEE;flex-shrink:0;}
+.entr-stat{padding:0 12px;}
+.entr-stat:first-child{padding-left:0;}
+.entr-stat+.entr-stat{border-left:1px solid #EEE;}
+.entr-stat-lbl{color:#888;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;}
+.entr-stat-val{font-size:22px;font-weight:700;line-height:1;}
+.entr-prog{padding:12px 24px;border-bottom:1px solid #EEE;flex-shrink:0;}
+.entr-prog-bar{height:8px;background:#EEE;border-radius:4px;overflow:hidden;margin-top:6px;}
+.entr-prog-fill{height:100%;border-radius:4px;transition:width 0.4s;}
+.entr-section-hdr{padding:8px 24px;background:#F9F9F9;border-bottom:1px solid #EEE;border-top:1px solid #EEE;display:flex;align-items:center;gap:8px;position:sticky;top:0;z-index:5;}
+.entr-section-title{font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;}
+.entr-section-cnt{font-size:10px;color:#AAA;}
+.entr-tbl{width:100%;border-collapse:collapse;font-size:11px;}
+.entr-tbl th{color:#888;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:6px 16px;text-align:left;border-bottom:1px solid #EEE;background:white;white-space:nowrap;}
+.entr-tbl td{color:#1A1A1A;font-size:12px;padding:5px 16px;border-bottom:1px solid #F5F5F5;white-space:nowrap;}
+.entr-tbl-wrap{overflow-x:auto;}
+.entr-tbl tr:hover td{background:#FFF5F5;}
 </style>
 </head>
 <body>
@@ -567,7 +594,7 @@ tr:hover td{background:#FFF5F5;}
             <th style="width:115px">Código</th><th style="max-width:95px">Cidade</th><th style="max-width:85px">Bairro</th><th style="max-width:105px">Destinatário</th><th style="width:98px">Status</th><th style="width:110px">Dt Evento</th><th style="width:72px">Previsão</th><th style="max-width:78px">Rota</th><th style="width:65px">Dias</th>
           </tr></thead><tbody id="dash-tb"></tbody></table>
           <table id="dash-table-entr" style="display:none"><thead><tr>
-            <th>Entregador</th><th style="width:100px;text-align:right">Previsto Hoje</th><th style="width:85px;text-align:right">Entregues</th><th style="width:70px;text-align:right">Faltam</th><th style="width:65px;text-align:right">SLA%</th>
+            <th>Entregador</th><th style="width:100px;text-align:right">Previsto Hoje</th><th style="width:85px;text-align:right">Entregues</th><th style="width:70px;text-align:right">Faltam</th><th style="width:65px;text-align:right">SLA%</th><th style="width:90px;text-align:center">Risco</th>
           </tr></thead><tbody id="dash-tb-entr"></tbody></table>
         </div>
         <div class="tfooter"><span id="dash-cnt">0</span><span>máx 300 linhas — use filtros ou exporte</span></div>
@@ -944,6 +971,21 @@ tr:hover td{background:#FFF5F5;}
     <span id="dr-total" style="color:var(--muted);font-size:11px;"></span>
     <button class="xbtn" onclick="exportDrawer()">⬇ Exportar Excel</button>
   </div>
+</div>
+
+<!-- ENTREGADOR DRAWER -->
+<div class="drawer-overlay" id="entr-dov" onclick="closeEntrDrawer()"></div>
+<div class="entr-drawer" id="entr-drawer">
+  <div class="drawer-hdr">
+    <div>
+      <div class="drawer-title" id="entr-drawer-name">—</div>
+      <div style="color:rgba(255,255,255,0.6);font-size:11px;margin-top:3px" id="entr-drawer-risco"></div>
+    </div>
+    <button class="drawer-close" onclick="closeEntrDrawer()">✕ Fechar</button>
+  </div>
+  <div class="entr-stats" id="entr-stats"></div>
+  <div class="entr-prog" id="entr-prog"></div>
+  <div style="flex:1;overflow-y:auto" id="entr-sections"></div>
 </div>
 
 <div id="toast"></div>
@@ -2197,7 +2239,7 @@ function calcEntregadorSummary(rows){
   _entrDetailRows=base;
   const sumMap={};
   base.forEach(r=>{
-    const k=r.Entr||'—';
+    const k=r.Entr||'Sem entregador';
     if(!sumMap[k])sumMap[k]={entr:k,previsto:0,entregues:0,faltam:0,custodia:0};
     sumMap[k].previsto++;
     if(isEnt(r))sumMap[k].entregues++;
@@ -2207,6 +2249,74 @@ function calcEntregadorSummary(rows){
   return Object.values(sumMap)
     .map(s=>({...s,sla:s.previsto>0?Math.round(s.entregues/s.previsto*100):100}))
     .sort((a,b)=>a.sla-b.sla||b.faltam-a.faltam);
+}
+
+// ── ENTREGADOR DRAWER ──
+function calcRisco(s){
+  const h=new Date().getHours();
+  if(s.sla<85||(h>=15&&s.faltam>=3)||(h>=17&&s.faltam>0))return'crit';
+  if(s.sla<95||(h>=15&&s.faltam>0))return'aten';
+  return'ok';
+}
+function riscoHtml(s){
+  const r=calcRisco(s);
+  const labels={ok:'🟢 OK',aten:'🟡 Atenção',crit:'🔴 Crítico'};
+  return`<span class="risco-badge risco-${r}">${labels[r]}</span>`;
+}
+function openEntrDrawer(entr){
+  const summary=calcEntregadorSummary(dashRows).find(s=>s.entr===entr);
+  if(!summary)return;
+  const allForEntr=dashRows.filter(r=>(r.Entr||'Sem entregador')===entr);
+  const slaForEntr=_entrDetailRows.filter(r=>(r.Entr||'Sem entregador')===entr);
+  const isEnt=r=>r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP';
+  const isCust=r=>r.Status==='CUSTODIA';
+  const isPend=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
+  const isTrav=r=>r.Status==='TRAVADO';
+  const col=summary.sla>=90?'var(--green)':summary.sla>=70?'var(--amber)':'var(--red)';
+  const barCol=summary.sla>=90?'#22A05B':summary.sla>=70?'#E5A100':'#CC0000';
+  document.getElementById('entr-drawer-name').textContent=entr;
+  document.getElementById('entr-drawer-risco').innerHTML=riscoHtml(summary);
+  document.getElementById('entr-stats').innerHTML=[
+    {lbl:'Previsto',val:summary.previsto,c:'var(--text)'},
+    {lbl:'Entregues',val:summary.entregues,c:'var(--green)'},
+    {lbl:'Faltam',val:summary.faltam,c:summary.faltam>0?'var(--red)':'var(--text)'},
+    {lbl:'Custódia',val:summary.custodia,c:'var(--purple)'},
+    {lbl:'SLA%',val:summary.sla+'%',c:col},
+  ].map(s=>`<div class="entr-stat"><div class="entr-stat-lbl">${s.lbl}</div><div class="entr-stat-val" style="color:${s.c}">${s.val}</div></div>`).join('');
+  document.getElementById('entr-prog').innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <span style="font-size:9px;font-weight:700;color:#888;letter-spacing:1px;text-transform:uppercase">Progresso SLA</span>
+      <span style="font-size:10px;color:#AAA">${summary.entregues} de ${summary.previsto} entregues</span>
+    </div>
+    <div class="entr-prog-bar"><div class="entr-prog-fill" style="width:${summary.sla}%;background:${barCol}"></div></div>`;
+  const rowHtml=(r,diasFn)=>`<tr>
+    <td class="td-codigo" style="cursor:pointer;font-weight:600" onclick="openCodeHistory('${r.Codigo}')">${r.Codigo}</td>
+    <td>${r.Cidade}</td>
+    <td class="td-ell" style="max-width:90px" title="${r.Bairro}">${r.Bairro}</td>
+    <td class="td-ell" style="max-width:120px" title="${r.Dest||''}">${r.Dest||''}</td>
+    <td><span class="badge ${bc(r.Status)}">${r.Status}</span></td>
+    <td>${r.DtEvento}</td><td>${r.Previsao}</td>
+    <td>${diasFn(r)}</td></tr>`;
+  const thead=`<thead><tr><th>Código</th><th>Cidade</th><th>Bairro</th><th>Destinatário</th><th>Status</th><th>Dt Evento</th><th>Previsão</th><th>Dias</th></tr></thead>`;
+  const sec=(title,color,rows,diasFn)=>{
+    if(!rows.length)return'';
+    return`<div class="entr-section-hdr"><div class="entr-section-title" style="color:${color}">${title}</div><div class="entr-section-cnt">${rows.length} remessa${rows.length!==1?'s':''}</div></div>
+    <div class="entr-tbl-wrap"><table class="entr-tbl">${thead}<tbody>${rows.map(r=>rowHtml(r,diasFn)).join('')}</tbody></table></div>`;
+  };
+  const diasNormal=r=>dc(r.Dias,r.Status);
+  document.getElementById('entr-sections').innerHTML=[
+    sec('Vencendo Hoje','#CC0000',slaForEntr.filter(isPend),diasNormal),
+    sec('Em Rota','#E5A100',allForEntr.filter(r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'),diasNormal),
+    sec('Entregues','#22A05B',allForEntr.filter(isEnt),diasNormal),
+    sec('Custódia','#8B6FE8',allForEntr.filter(isCust),diasNormal),
+    sec('Travadas','#CC0000',allForEntr.filter(isTrav),r=>dcTrav(r)),
+  ].join('');
+  document.getElementById('entr-dov').classList.add('open');
+  document.getElementById('entr-drawer').classList.add('open');
+}
+function closeEntrDrawer(){
+  document.getElementById('entr-dov').classList.remove('open');
+  document.getElementById('entr-drawer').classList.remove('open');
 }
 
 function renderDashTable(rows){
@@ -2229,12 +2339,14 @@ function filterDash(){
     const filtered=q?summary.filter(s=>s.entr.toLowerCase().includes(q)):summary;
     document.getElementById('dash-tb-entr').innerHTML=filtered.map(s=>{
       const col=s.sla>=90?'#22A05B':s.sla>=70?'#E5A100':'#CC0000';
-      return`<tr>
+      const eEntr=s.entr.replace(/"/g,'&quot;');
+      return`<tr style="cursor:pointer" data-entr="${eEntr}" onclick="openEntrDrawer(this.dataset.entr)">
         <td style="font-weight:600">${s.entr}</td>
         <td style="text-align:right">${s.previsto}</td>
         <td style="text-align:right;color:#22A05B;font-weight:700">${s.entregues}</td>
         <td style="text-align:right;color:${s.faltam>0?'#CC0000':'#888'};font-weight:${s.faltam>0?700:400}">${s.faltam}</td>
         <td style="text-align:right;color:${col};font-weight:700">${s.sla}%</td>
+        <td style="text-align:center">${riscoHtml(s)}</td>
       </tr>`;
     }).join('');
     document.getElementById('dash-cnt').textContent=filtered.length+' entregadores — '+_entrDetailRows.length+' remessas no SLA';
@@ -2261,7 +2373,7 @@ function exportDash(){
     const summary=calcEntregadorSummary(dashRows);
     const stats={};summary.forEach(s=>{stats[s.entr]=s;});
     const out=_entrDetailRows.map(r=>{
-      const s=stats[r.Entr||'—']||{previsto:0,entregues:0,faltam:0,sla:0};
+      const s=stats[r.Entr||'Sem entregador']||{previsto:0,entregues:0,faltam:0,sla:0};
       return{
         'Código':r.Codigo,'Cidade':r.Cidade,'Bairro':r.Bairro,'Destinatário':r.Dest||'',
         'Status':r.Status,'Dt Evento':r.DtEvento,'Previsão':r.Previsao,
