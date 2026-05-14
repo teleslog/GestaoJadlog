@@ -1195,10 +1195,286 @@ async def get_dados(
     return JSONResponse(entry)
 
 
+# ── DIAG SLA — helpers compartilhados ──────────────────────────────────────
+# Replica fielmente entraNoSlaHoje (frontend, com safety net Status=ENTRADA+DtEvento)
+# e a classificação calcM. Fonte única em Python, sem regra paralela.
+
+_PEND_STATUS = {"EM ROTA", "EM ROTA PICKUP", "ENTRADA"}
+_ENT_STATUS  = {"ENTREGUE", "ENTREGUE NO PICKUP"}
+
+
+def _diag_ddiff(prev_str: str, today: datetime):
+    d = _parse_dt_evento(prev_str[:10] if prev_str else "")
+    if not d:
+        return None
+    d = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (today - d).days
+
+
+def _diag_is_today(dt_str: str, today: datetime) -> bool:
+    d = _parse_dt_evento(dt_str[:10] if dt_str else "")
+    if not d:
+        return False
+    return d.replace(hour=0, minute=0, second=0, microsecond=0) >= today
+
+
+def _diag_entra_no_sla(row: dict, today: datetime) -> tuple[bool, str]:
+    """
+    Replica frontend entraNoSlaHoje (linha ~1973 de GestãoEntregas.html):
+      candidatos: PE (se houver) + DtEvento se Status=ENTRADA. Vence o MIN.
+      Se MIN < hoje OU > hoje OU hoje<10h → inclui (true). Hoje >=10h → exclui (false).
+    """
+    pe_str = str(row.get("__primeira_entrada", "")).strip()
+    dt_str = str(row.get("Dt Evento", "")).strip()
+    status = str(row.get("Status", "")).strip().upper()
+    cands = []
+    if pe_str:
+        cands.append(("PE", pe_str))
+    if status == "ENTRADA" and dt_str:
+        cands.append(("DtEv(ENTRADA)", dt_str))
+    if not cands:
+        return True, "sem candidato → inclui por precaução"
+    parsed = []
+    for lbl, s in cands:
+        d = _parse_dt_evento(s)
+        if d:
+            parsed.append((lbl, s, d))
+    if not parsed:
+        return True, "candidatos não parsearam → inclui"
+    parsed.sort(key=lambda x: x[2])
+    lbl, s, d = parsed[0]
+    dd = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    if dd < today:
+        return True, f"{lbl}={s[:10]} < hoje → inclui (histórico)"
+    if dd > today:
+        return True, f"{lbl}={s[:10]} > hoje → inclui (futuro)"
+    if d.hour < 10:
+        return True, f"{lbl}={d.strftime('%H:%M')} < 10h → inclui"
+    return False, f"{lbl}={d.strftime('%H:%M')} >= 10h → EXCLUI"
+
+
+def _diag_build_dashrows(op_filter: str | None) -> tuple[dict[str, dict], dict[str, str]]:
+    """
+    Replica parseOp + dedup do frontend (getRows, currentOp='all'):
+      - parseOp filtra Hist. ultimo ponto == op_name (estrito)
+      - dedup por Codigo entre as 4 ops, vencendo o de DtEvento mais recente
+    Retorna (dash_by_code, op_of_code) usando _cache em produção.
+    """
+    known_ops = {op_name.upper() for op_name, _ in OPS.values()}
+    op_keys = [op_filter] if (op_filter and op_filter in OPS) else list(OPS.keys())
+
+    dash_by_code: dict[str, dict] = {}
+    op_of_code:   dict[str, str]  = {}
+
+    for key in op_keys:
+        op_name = OPS[key][0]
+        entry = _cache.get("operacional", {}).get(key) or {}
+        rows = entry.get("dados") or []
+        if not rows:
+            continue
+        # parseOp do frontend
+        has_known = any(
+            str(r.get("Hist. ultimo ponto", "")).strip().upper() in known_ops
+            for r in rows
+        )
+        op_upper = op_name.upper()
+        for r in rows:
+            cod = str(r.get("Codigo", "")).strip()
+            if not cod:
+                continue
+            if has_known and str(r.get("Hist. ultimo ponto", "")).strip().upper() != op_upper:
+                continue
+            ex = dash_by_code.get(cod)
+            if ex is None:
+                dash_by_code[cod] = r
+                op_of_code[cod] = key
+                continue
+            d_ex  = _parse_dt_evento(ex.get("Dt Evento", ""))
+            d_new = _parse_dt_evento(r.get("Dt Evento", ""))
+            if d_new and (not d_ex or d_new > d_ex):
+                dash_by_code[cod] = r
+                op_of_code[cod] = key
+    return dash_by_code, op_of_code
+
+
+def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
+    """
+    Auditoria completa do painel SLA + validação da regra das 10h.
+    Reproduz: parseOp + dedup + calcM + entraNoSlaHoje.
+    """
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    dash_by_code, op_of_code = _diag_build_dashrows(op_filter)
+
+    if codigos_filter:
+        dash_by_code = {c: r for c, r in dash_by_code.items() if c in codigos_filter}
+
+    counts = {"vencidas": 0, "vencem_hoje": 0, "entregues_sla": 0, "custodia_sla": 0,
+              "excluidas_10h": 0, "fora_sla": 0}
+    detalhes: list[dict] = []
+    inconsistencias: list[dict] = []
+    suspeitas: list[dict] = []
+
+    for cod, r in dash_by_code.items():
+        status   = str(r.get("Status", "")).strip().upper()
+        prev_str = str(r.get("Previsao", ""))
+        dt_str   = str(r.get("Dt Evento", ""))
+        ddiff    = _diag_ddiff(prev_str, today)
+        entra, motivo = _diag_entra_no_sla(r, today)
+
+        buckets: list[str] = []
+        if ddiff is not None:
+            if status in _PEND_STATUS and ddiff > 0 and entra:
+                buckets.append("VENCIDAS"); counts["vencidas"] += 1
+            if status in _PEND_STATUS and ddiff == 0 and entra:
+                buckets.append("VENCEM_HOJE"); counts["vencem_hoje"] += 1
+            if status in _ENT_STATUS and ddiff >= 0 and (_diag_is_today(dt_str, today) or ddiff == 0) and entra:
+                buckets.append("ENTREGUES_SLA"); counts["entregues_sla"] += 1
+            if status == "CUSTODIA" and ddiff == 0 and entra:
+                buckets.append("CUSTODIA_SLA"); counts["custodia_sla"] += 1
+        if not entra:
+            counts["excluidas_10h"] += 1
+        if not buckets:
+            counts["fora_sla"] += 1
+
+        # Validação ESTRITA: pacote no SLA cuja primeira entrada conhecida é hoje >=10h.
+        # PE_real hoje >=10h ou Status=ENTRADA atual hoje >=10h → viola a regra (bug).
+        tipo_inc = None
+        suspeita = None
+        if buckets:
+            pe_str   = str(r.get("__primeira_entrada", "")).strip()
+            pe_proxy = bool(r.get("__pe_proxy", False))
+            pe_d     = _parse_dt_evento(pe_str)
+            pe_day   = pe_d.replace(hour=0, minute=0, second=0, microsecond=0) if pe_d else None
+            de       = _parse_dt_evento(dt_str)
+            de_day   = de.replace(hour=0, minute=0, second=0, microsecond=0) if de else None
+
+            # Estrita: PE real (não proxy) hoje >=10h, ou Status=ENTRADA hoje >=10h.
+            if pe_d and not pe_proxy and pe_day == today and pe_d.hour >= 10:
+                tipo_inc = f"PE_real hoje {pe_d:%H:%M} >=10h no SLA"
+            elif status == "ENTRADA" and de and de_day == today and de.hour >= 10:
+                tipo_inc = f"Status=ENTRADA hoje {de:%H:%M} >=10h no SLA"
+
+            # Suspeita (auditoria visual): no SLA com DtEvento hoje>=10h E PE proxy
+            # apontando antes de hoje. Pós-fix de Hist deve ser sempre legítimo
+            # (pacote estava na torre antes), mas listamos para conferência manual.
+            if not tipo_inc and pe_proxy and pe_d and pe_day < today \
+                    and de and de_day == today and de.hour >= 10:
+                suspeita = f"PE_proxy={pe_str[:10]} (estava na torre antes), DtEvento hoje {de:%H:%M}"
+
+        if tipo_inc:
+            inconsistencias.append({"codigo": cod, "operacao": op_of_code.get(cod, "?"), "tipo": tipo_inc,
+                                    "status": status, "dt_evento": dt_str,
+                                    "primeira_entrada": str(r.get("__primeira_entrada", "")),
+                                    "categoria_sla": ",".join(buckets)})
+        if suspeita:
+            suspeitas.append({"codigo": cod, "operacao": op_of_code.get(cod, "?"), "tipo": suspeita,
+                              "status": status, "dt_evento": dt_str,
+                              "primeira_entrada": str(r.get("__primeira_entrada", "")),
+                              "categoria_sla": ",".join(buckets)})
+
+        rota = (str(r.get("Rota", "")).strip()
+                or str(r.get("Hist. ultimo operador", "")).strip()
+                or "—")
+
+        detalhes.append({
+            "codigo": cod,
+            "operacao": op_of_code.get(cod, "?"),
+            "status_atual": status,
+            "dt_evento": dt_str,
+            "previsao": prev_str,
+            "ddiff": ddiff,
+            "primeira_entrada_valida": str(r.get("__primeira_entrada", "")),
+            "pe_proxy": bool(r.get("__pe_proxy", False)),
+            "rota_entregador": rota,
+            "entrou_no_sla": bool(buckets),
+            "categoria_sla": ",".join(buckets) if buckets else "—",
+            "motivo": motivo,
+            "inconsistente": bool(tipo_inc),
+            "tipo_inconsistencia": tipo_inc,
+        })
+
+    den = counts["entregues_sla"] + counts["vencidas"] + counts["vencem_hoje"]
+    sla_pct = round(counts["entregues_sla"] / den * 100, 2) if den else 100.0
+
+    return {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "today": today.strftime("%Y-%m-%d"),
+        "filtros": {"operacao": op_filter, "codigos": sorted(codigos_filter) if codigos_filter else None},
+        "resumo": {
+            "dashboard_total": len(dash_by_code),
+            "total_sla": counts["vencidas"] + counts["vencem_hoje"] + counts["entregues_sla"] + counts["custodia_sla"],
+            "vencidas": counts["vencidas"],
+            "vencem_hoje": counts["vencem_hoje"],
+            "entregues_sla": counts["entregues_sla"],
+            "custodia_sla": counts["custodia_sla"],
+            "faltam": counts["vencidas"] + counts["vencem_hoje"],
+            "sla_percentual": sla_pct,
+        },
+        "auditoria": {
+            "total_excluidas_10h": counts["excluidas_10h"],
+            "inconsistencias": len(inconsistencias),
+            "inconsistencias_detalhe": inconsistencias[:100],
+            "remessas_suspeitas": len(suspeitas),
+            "remessas_suspeitas_detalhe": suspeitas[:100],
+        },
+        "detalhes": detalhes,
+    }
+
+
+def _diag_audit_to_csv(payload: dict) -> str:
+    """Serializa detalhes da auditoria em CSV (delimitador ;)."""
+    import io as _io, csv as _csv
+    buf = _io.StringIO()
+    w = _csv.writer(buf, delimiter=";", quoting=_csv.QUOTE_MINIMAL)
+    w.writerow(["Codigo","Operacao","Status","DtEvento","Previsao","dDiff",
+                "PrimeiraEntrada","PE_proxy","Rota_Entregador",
+                "EntrouNoSLA","CategoriaSLA","Motivo","Inconsistente","TipoInconsistencia"])
+    for d in payload.get("detalhes", []):
+        w.writerow([d["codigo"], d["operacao"], d["status_atual"], d["dt_evento"],
+                    d["previsao"], d["ddiff"], d["primeira_entrada_valida"], d["pe_proxy"],
+                    d["rota_entregador"], d["entrou_no_sla"], d["categoria_sla"],
+                    d["motivo"], d["inconsistente"], d["tipo_inconsistencia"] or ""])
+    return buf.getvalue()
+
+
 @app.get("/diag/sla")
-async def diag_sla(codigos: str, admin: User = Depends(_require_gestor)):
-    """Diagnóstico da regra das 10h para códigos específicos (CSV). Ex: /diag/sla?codigos=123,456"""
-    from datetime import date as _date
+async def diag_sla(
+    codigos: str | None = None,
+    mode: str | None = None,
+    op: str | None = None,
+    export: str | None = None,
+    admin: User = Depends(_require_gestor),
+):
+    """
+    Diagnóstico SLA.
+
+    Modos:
+      mode=audit         → auditoria completa do painel + inconsistências da regra 10h
+      (sem mode)         → legado: diagnóstico por código (codigos=A,B,C obrigatório)
+
+    Filtros (modo audit):
+      op=gv|itabira|jm|curvelo   → restringe a uma operação
+      codigos=A,B,C              → restringe a códigos específicos
+      export=csv                 → retorna CSV em vez de JSON
+    """
+    if mode == "audit":
+        cset = {c.strip() for c in codigos.split(",") if c.strip()} if codigos else None
+        op_key = op if (op and op in OPS) else None
+        async with _cache_lock:
+            payload = _diag_audit(op_filter=op_key, codigos_filter=cset)
+        if export == "csv":
+            from fastapi.responses import PlainTextResponse
+            csv_text = _diag_audit_to_csv(payload)
+            fname = f"diag_sla_audit_{payload['today']}.csv"
+            return PlainTextResponse(
+                content=csv_text, media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            )
+        return payload
+
+    # Modo legado — diagnóstico por código
+    if not codigos:
+        raise HTTPException(400, "Use codigos=A,B,C ou mode=audit")
     target = {c.strip() for c in codigos.split(",") if c.strip()}
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     result = []
@@ -1209,39 +1485,18 @@ async def diag_sla(codigos: str, admin: User = Depends(_require_gestor)):
                     cod = str(row.get("Codigo", "")).strip()
                     if cod not in target:
                         continue
-                    pe = str(row.get("__primeira_entrada", ""))
-                    previsao = str(row.get("Previsao", ""))
-                    dt_ev = str(row.get("Dt Evento", ""))
-                    # Recalcula entraNoSlaHoje
-                    entra = True
-                    pe_reason = "PE vazia → fallback true"
-                    if pe:
-                        d = _parse_dt_evento(pe[:10])
-                        if d:
-                            if d.date() < today.date():
-                                pe_reason = f"PE {pe[:10]} < hoje → inclui"
-                            elif d.date() > today.date():
-                                pe_reason = f"PE {pe[:10]} > hoje → inclui"
-                            else:
-                                hh = int(pe[11:13]) if len(pe) >= 13 else -1
-                                if hh < 0:
-                                    pe_reason = "PE hoje sem hora → fallback true"
-                                elif hh < 10:
-                                    pe_reason = f"PE hoje {pe[11:16]} < 10h → inclui"
-                                else:
-                                    entra = False
-                                    pe_reason = f"PE hoje {pe[11:16]} >= 10h → EXCLUI"
-                    # dDiff previsao
-                    dp = _parse_dt_evento(previsao[:10])
-                    ddiff = (today.date() - dp.date()).days if dp else None
+                    entra, motivo = _diag_entra_no_sla(row, today)
+                    ddiff = _diag_ddiff(str(row.get("Previsao", "")), today)
                     result.append({
                         "codigo": cod, "tipo": tipo, "key": key,
                         "status": row.get("Status", ""),
-                        "previsao": previsao, "ddiff": ddiff,
-                        "dt_evento": dt_ev,
-                        "primeira_entrada": pe or "(vazio)",
+                        "previsao": str(row.get("Previsao", "")),
+                        "ddiff": ddiff,
+                        "dt_evento": str(row.get("Dt Evento", "")),
+                        "primeira_entrada": str(row.get("__primeira_entrada", "")) or "(vazio)",
+                        "pe_proxy": bool(row.get("__pe_proxy", False)),
                         "entraNoSlaHoje": entra,
-                        "motivo": pe_reason,
+                        "motivo": motivo,
                     })
     not_found = target - {r["codigo"] for r in result}
     return {"ts": datetime.now().isoformat(timespec="seconds"), "diagnostico": result,
