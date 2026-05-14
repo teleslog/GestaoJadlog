@@ -1171,7 +1171,9 @@ function applyFinJoin(opIdx){
   if(!fmap.size)return 0;
   let filled=0;
   map.forEach((row,codigo)=>{
-    if(!row.Entr&&fmap.has(codigo)){
+    // Não propaga entregador histórico do financeiro para TRAVADO:
+    // pacote travado não tem rota ativa e apareceria no drawer errado.
+    if(!row.Entr&&row.Status!=='TRAVADO'&&fmap.has(codigo)){
       row.Entr=fmap.get(codigo);
       filled++;
     }
@@ -2698,17 +2700,20 @@ function renderTimelineCard(codigo,events){
   const _pdt=s=>{if(!s)return 0;const m=String(s).trim().match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);return m?new Date(+m[3],+m[2]-1,+m[1],+(m[4]||0),+(m[5]||0),+(m[6]||0)).getTime():0;};
   // 1) sort por loadedAt DESC → snapshot mais recente vence no dedup
   const sorted=[...events].sort((a,b)=>new Date(b.loadedAt)-new Date(a.loadedAt));
-  // 2) dedup global por (status + dtEvento) — remove todas as repetições, não só consecutivas
+  // 2) dedup por (status + data-apenas): mesmo status no mesmo dia → mantém snapshot mais recente
   const _seen=new Set();
   const deduped=sorted.filter(e=>{
-    const key=(e.status||'').trim().toUpperCase()+'|'+(e.dtEvento||'').trim();
+    const key=(e.status||'').trim().toUpperCase()+'|'+(e.dtEvento||'').trim().substring(0,10);
     if(_seen.has(key))return false;
     _seen.add(key);return true;
   });
-  // 3) reordenar por dtEvento DESC; empate → loadedAt DESC
-  deduped.sort((a,b)=>{const d=_pdt(b.dtEvento)-_pdt(a.dtEvento);return d!==0?d:new Date(b.loadedAt)-new Date(a.loadedAt);});
-  const timeline=deduped.map((e,i)=>{
-    const isCurr=i===0;
+  // 3) ordenar por dtEvento ASC (mais antigo → mais novo) para leitura cronológica
+  deduped.sort((a,b)=>{const d=_pdt(a.dtEvento)-_pdt(b.dtEvento);return d!==0?d:new Date(a.loadedAt)-new Date(b.loadedAt);});
+  // 4) remover status consecutivos iguais — exibe apenas transições reais de status
+  const clean=deduped.filter((e,i)=>i===0||(e.status||'').trim().toUpperCase()!==(deduped[i-1].status||'').trim().toUpperCase());
+  const last=clean.length-1;
+  const timeline=clean.map((e,i)=>{
+    const isCurr=i===last;
     return`<div class="timeline-event" style="${isCurr?'background:#FFFBEB;border-radius:6px;padding:6px 8px;margin:-2px 0;':''}">
       <div class="timeline-ts" style="font-size:13px;${isCurr?'font-weight:700;color:#1A1A1A':'color:#888'}">
         ${e.dtEvento||'—'}
@@ -2730,7 +2735,7 @@ function renderTimelineCard(codigo,events){
       </div>
       <div style="display:flex;gap:8px;align-items:center">
         ${current?`<span class="badge ${bc(current.Status)}" style="font-size:10px">${current.Status}</span>`:'<span style="color:#AAA;font-size:10px">Não está na carga atual</span>'}
-        <span style="color:#AAA;font-size:9px">${deduped.length} evento(s)</span>
+        <span style="color:#AAA;font-size:9px">${clean.length} evento(s)</span>
       </div>
     </div>
     <div style="padding:14px 20px">

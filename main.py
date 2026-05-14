@@ -540,12 +540,14 @@ def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
     """
     Varre uma lista de linhas brutas do xlsx e retorna {codigo: 'dd/mm/yyyy HH:MM:SS'}
     com o valor de __primeira_entrada para a regra das 10h:
-      - Se existe ENTRADA HOJE: usa a mais recente de hoje (detecta re-rota após 10h).
+      - Se existe ENTRADA HOJE: usa a MAIS ANTIGA de hoje (primeiro scan do dia).
+        Isso garante que pacote com primeiro scan às 08:30 (antes das 10h) seja incluído
+        mesmo que tenha um segundo scan às 11:30 no mesmo dia.
       - Se existe ENTRADA só no passado: usa a mais antiga histórica.
-    Garante que re-rotas com ENTRADA hoje após 10h sejam corretamente excluídas do SLA.
+    Prioridade: ENTRADA hoje > ENTRADA histórica, pois determina elegibilidade do dia.
     """
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_entrada: dict[str, datetime] = {}   # mais recente ENTRADA de hoje
+    today_entrada: dict[str, datetime] = {}   # mais antiga ENTRADA de hoje (primeiro scan)
     hist_entrada:  dict[str, datetime] = {}   # mais antiga ENTRADA histórica
 
     for row in rows:
@@ -558,7 +560,7 @@ def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
         if dt is None:
             continue
         if dt >= today:
-            if codigo not in today_entrada or dt > today_entrada[codigo]:
+            if codigo not in today_entrada or dt < today_entrada[codigo]:   # mínimo hoje
                 today_entrada[codigo] = dt
         else:
             if codigo not in hist_entrada or dt < hist_entrada[codigo]:
@@ -897,8 +899,8 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                 existing_pe = _parse_dt_evento(existing_pe_str)
                 new_pe = _parse_dt_evento(pe_str)
                 if new_pe and new_pe >= today_midnight:
-                    # Nova PE é de hoje: vence PE histórica ou PE mais antiga de hoje
-                    if not existing_pe or existing_pe < today_midnight or new_pe > existing_pe:
+                    # Nova PE é de hoje: vence PE histórica; se cache já tem PE de hoje, mantém a mais antiga
+                    if not existing_pe or existing_pe < today_midnight or new_pe < existing_pe:
                         merged[codigo]["__primeira_entrada"] = pe_str
                 else:
                     # Nova PE é histórica: só atualiza se for mais antiga que a existente
