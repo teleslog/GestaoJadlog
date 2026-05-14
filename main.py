@@ -538,18 +538,11 @@ def _parse_dt_evento(s: str) -> datetime | None:
 
 def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
     """
-    Varre uma lista de linhas brutas do xlsx e retorna {codigo: 'dd/mm/yyyy HH:MM:SS'}
-    com o valor de __primeira_entrada para a regra das 10h:
-      - Se existe ENTRADA HOJE: usa a MAIS ANTIGA de hoje (primeiro scan do dia).
-        Isso garante que pacote com primeiro scan às 08:30 (antes das 10h) seja incluído
-        mesmo que tenha um segundo scan às 11:30 no mesmo dia.
-      - Se existe ENTRADA só no passado: usa a mais antiga histórica.
-    Prioridade: ENTRADA hoje > ENTRADA histórica, pois determina elegibilidade do dia.
+    Retorna {codigo: 'dd/mm/yyyy HH:MM:SS'} com o MENOR Dt Evento onde Status='ENTRADA'.
+    Sem prioridade hoje vs histórico — a primeira entrada operacional é sempre a mais antiga.
+    Re-scan posterior nunca reseta a PE: vence sempre a entrada mais antiga conhecida.
     """
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_entrada: dict[str, datetime] = {}   # mais antiga ENTRADA de hoje (primeiro scan)
-    hist_entrada:  dict[str, datetime] = {}   # mais antiga ENTRADA histórica
-
+    primeira: dict[str, datetime] = {}
     for row in rows:
         codigo = str(row.get("Codigo", "")).strip()
         if not codigo:
@@ -559,20 +552,9 @@ def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
         dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
         if dt is None:
             continue
-        if dt >= today:
-            if codigo not in today_entrada or dt < today_entrada[codigo]:   # mínimo hoje
-                today_entrada[codigo] = dt
-        else:
-            if codigo not in hist_entrada or dt < hist_entrada[codigo]:
-                hist_entrada[codigo] = dt
-
-    result: dict[str, str] = {}
-    for codigo, dt in today_entrada.items():
-        result[codigo] = dt.strftime("%d/%m/%Y %H:%M:%S")
-    for codigo, dt in hist_entrada.items():
-        if codigo not in result:
-            result[codigo] = dt.strftime("%d/%m/%Y %H:%M:%S")
-    return result
+        if codigo not in primeira or dt < primeira[codigo]:
+            primeira[codigo] = dt
+    return {c: dt.strftime("%d/%m/%Y %H:%M:%S") for c, dt in primeira.items()}
 
 
 def _read_xlsx(path: Path) -> list[dict]:
@@ -654,25 +636,32 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
         except Exception as exc:
             log.error(f"[merge] {path.name}: {exc}")
 
-    # Injeta PE a partir de eventos ENTRADA (mais preciso).
-    # _compute_primeira_entrada agora retorna a ENTRADA mais recente de HOJE (se existir),
-    # ou a mais antiga histórica — cobre re-rotas que tiveram ENTRADA hoje após 10h.
+    # Injeta PE real (MIN Dt Evento onde Status=ENTRADA, em qualquer arquivo).
     pe_map = _compute_primeira_entrada(all_rows_for_pe)
     for codigo, pe_str in pe_map.items():
         if codigo in merged:
             merged[codigo]["__primeira_entrada"] = pe_str
+            merged[codigo]["__pe_proxy"] = False
 
-    # Proxy PE: para códigos sem __primeira_entrada (sem nenhum evento ENTRADA nos arquivos),
-    # usa Dt Evento do estado atual (arquivo mais recente). Marcado como __pe_proxy=True para
-    # que merge_incremental não o confunda com PE real de ENTRADA ao restaurar pe_old.
-    for codigo, row in merged.items():
-        if codigo.startswith("__nk_"):
+    # Proxy PE: para códigos sem nenhum evento ENTRADA em nenhum arquivo,
+    # usa o MENOR Dt Evento histórico em qualquer arquivo (não o mais recente).
+    # Sem esse mínimo, códigos que entraram em transferência ontem ficariam
+    # com proxy=hoje (Dt Evento do último estado) e seriam excluídos erradamente.
+    earliest_dt: dict[str, datetime] = {}
+    for row in all_rows_for_pe:
+        codigo = str(row.get("Codigo", "")).strip()
+        if not codigo:
             continue
-        if not row.get("__primeira_entrada", ""):
-            dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
-            if dt:
-                row["__primeira_entrada"] = dt.strftime("%d/%m/%Y %H:%M:%S")
-                row["__pe_proxy"] = True   # aproximação — não é scan de ENTRADA real
+        dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
+        if dt is None:
+            continue
+        if codigo not in earliest_dt or dt < earliest_dt[codigo]:
+            earliest_dt[codigo] = dt
+
+    for codigo, dt in earliest_dt.items():
+        if codigo in merged and not merged[codigo].get("__primeira_entrada", ""):
+            merged[codigo]["__primeira_entrada"] = dt.strftime("%d/%m/%Y %H:%M:%S")
+            merged[codigo]["__pe_proxy"] = True
 
     return list(merged.values())
 
@@ -876,52 +865,70 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
             else:
                 dt_new = _parse_dt_evento(row.get("Dt Evento", ""))
                 dt_ex  = _parse_dt_evento(ex.get("Dt Evento", ""))
+                # Preserva SEMPRE PE e flag de proxy antes de substituir a linha:
+                # PE rastreia primeira entrada operacional, que é um fato passado e
+                # nunca pode ser apagado por uma atualização posterior.
+                pe_old = ex.get("__primeira_entrada", "")
+                pe_old_is_proxy = ex.get("__pe_proxy", False)
                 if dt_new is None or (dt_ex is not None and dt_ex > dt_new):
                     pass  # mantém existente — evento mais recente no cache
                 else:
-                    pe_old = ex.get("__primeira_entrada", "")
-                    pe_old_is_proxy = ex.get("__pe_proxy", False)
                     merged[codigo] = row
-                    # Só restaura pe_old se for PE real (de scan ENTRADA), nunca proxy.
-                    # Proxy de DtEvento não pode bloquear um ENTRADA real que chega depois.
-                    if pe_old and not pe_old_is_proxy:
-                        merged[codigo]["__primeira_entrada"] = pe_old
                     rows_atualizadas += 1
+                # Restaura PE: real prevalece sobre vazio; proxy só preenche se PE estava vazia.
+                # Nunca limpa PE existente.
+                if pe_old:
+                    cur_pe = merged[codigo].get("__primeira_entrada", "")
+                    if not cur_pe:
+                        merged[codigo]["__primeira_entrada"] = pe_old
+                        merged[codigo]["__pe_proxy"] = pe_old_is_proxy
 
-        # Injeta/atualiza __primeira_entrada com dados do novo arquivo (regra das 10h).
-        # _compute_primeira_entrada retorna ENTRADA mais recente de HOJE (ou mais antiga histórica).
+        # Atualiza __primeira_entrada com evidência do novo arquivo.
+        # Regra: PE = MIN das ENTRADAs reais observadas. Real sempre vence proxy.
         nova_pe = _compute_primeira_entrada(new_rows)
-        today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         for codigo, pe_str in nova_pe.items():
             if codigo not in merged:
                 continue
+            new_pe = _parse_dt_evento(pe_str)
+            if not new_pe:
+                continue
             existing_pe_str = merged[codigo].get("__primeira_entrada", "")
             existing_is_proxy = merged[codigo].get("__pe_proxy", False)
-            if not existing_pe_str:
+            existing_pe = _parse_dt_evento(existing_pe_str) if existing_pe_str else None
+            if not existing_pe or existing_is_proxy:
+                # Vazio ou proxy: PE real do novo vence.
                 merged[codigo]["__primeira_entrada"] = pe_str
                 merged[codigo]["__pe_proxy"] = False
-            else:
-                existing_pe = _parse_dt_evento(existing_pe_str)
-                new_pe = _parse_dt_evento(pe_str)
-                if new_pe and new_pe >= today_midnight:
-                    # PE real de hoje: vence PE histórica OU proxy de qualquer hora
-                    # Se existing é real de hoje, mantém a mais antiga (primeiro scan real do dia)
-                    if not existing_pe or existing_pe < today_midnight or existing_is_proxy or new_pe < existing_pe:
-                        merged[codigo]["__primeira_entrada"] = pe_str
-                        merged[codigo]["__pe_proxy"] = False
-                else:
-                    # PE histórica real: só atualiza se for mais antiga que a existente
-                    if new_pe and existing_pe and new_pe < existing_pe:
-                        merged[codigo]["__primeira_entrada"] = pe_str
-                        merged[codigo]["__pe_proxy"] = False
+            elif new_pe < existing_pe:
+                # Ambos reais: mantém a MENOR (primeira entrada operacional verdadeira).
+                merged[codigo]["__primeira_entrada"] = pe_str
+                merged[codigo]["__pe_proxy"] = False
 
-        # Proxy PE para novos códigos sem __primeira_entrada após nova_pe:
-        # Aplica APENAS a códigos novos — existentes no cache ficam intactos.
-        # Marcado como __pe_proxy=True para não bloquear ENTRADA real futura.
-        for codigo in new_codes:
-            if not merged[codigo].get("__primeira_entrada", ""):
-                dt_ev = _parse_dt_evento(str(merged[codigo].get("Dt Evento", "")))
-                if dt_ev:
+        # Proxy PE: aplica MIN(Dt Evento) do novo arquivo a TODOS os códigos sem PE
+        # (novos OU existentes que perderam PE em snapshot anterior). Existentes com
+        # PE real ou proxy menor preservam o valor; só preenche o que estiver vazio
+        # ou substitui proxy maior por proxy menor.
+        new_min_dt: dict[str, datetime] = {}
+        for row in new_rows:
+            codigo = str(row.get("Codigo", "")).strip()
+            if not codigo:
+                continue
+            dt_ev = _parse_dt_evento(str(row.get("Dt Evento", "")))
+            if dt_ev is None:
+                continue
+            if codigo not in new_min_dt or dt_ev < new_min_dt[codigo]:
+                new_min_dt[codigo] = dt_ev
+        for codigo, dt_ev in new_min_dt.items():
+            if codigo not in merged:
+                continue
+            cur_pe_str = merged[codigo].get("__primeira_entrada", "")
+            cur_is_proxy = merged[codigo].get("__pe_proxy", False)
+            if not cur_pe_str:
+                merged[codigo]["__primeira_entrada"] = dt_ev.strftime("%d/%m/%Y %H:%M:%S")
+                merged[codigo]["__pe_proxy"] = True
+            elif cur_is_proxy:
+                cur_pe = _parse_dt_evento(cur_pe_str)
+                if not cur_pe or dt_ev < cur_pe:
                     merged[codigo]["__primeira_entrada"] = dt_ev.strftime("%d/%m/%Y %H:%M:%S")
                     merged[codigo]["__pe_proxy"] = True
 

@@ -1146,7 +1146,15 @@ function mergeOp(newRows,opIdx){
       const changed=ex.Status!==row.Status||ex.DtEvento!==row.DtEvento;
       const prevPE=ex.PrimeiraEntrada;
       Object.assign(ex,row);
-      if(!ex.PrimeiraEntrada&&prevPE)ex.PrimeiraEntrada=prevPE;
+      // PE = MIN(prev, novo). Primeira entrada operacional é fato passado:
+      // jamais substituir uma PE mais antiga por uma mais nova; jamais limpar.
+      const newPE=row.PrimeiraEntrada;
+      if(prevPE&&newPE){
+        const a=_parseDT(prevPE),b=_parseDT(newPE);
+        ex.PrimeiraEntrada=(a&&b)?(a<=b?prevPE:newPE):(prevPE||newPE);
+      }else if(prevPE&&!newPE){
+        ex.PrimeiraEntrada=prevPE;
+      }
       if(changed){
         (delta[row.Codigo]=delta[row.Codigo]||[]).push({status:row.Status,dtEvento:row.DtEvento,loadedAt:now,opIdx});
         updated++;
@@ -1969,17 +1977,32 @@ function refreshAll(){
 // Regra das 10h — helper CENTRALIZADO.
 // Retorna false → excluir do SLA de hoje (primeira entrada HOJE após 10h).
 // Retorna true  → incluir no SLA de hoje.
-// Usa PrimeiraEntrada (injetado pelo backend) — independente do status atual.
+//
+// Candidatos para "tempo de primeira entrada operacional", em ordem de força:
+//   1. PrimeiraEntrada (do backend) — fonte primária
+//   2. DtEvento quando Status=ENTRADA atual — evidência direta de entrada
+// Usa o MENOR (mais antigo) dos candidatos disponíveis. Safety net: mesmo
+// que PE esteja vazia/inconsistente, um Status=ENTRADA hoje >=10h é excluído.
 function entraNoSlaHoje(row){
-  const pe=String(row.PrimeiraEntrada||'');
-  if(!pe)return true; // sem dado: inclui por precaução
-  const d=parseDate(pe.substring(0,10));
+  const peStr=String(row.PrimeiraEntrada||'').trim();
+  const dtStr=String(row.DtEvento||'').trim();
+  const candidates=[];
+  if(peStr)candidates.push(peStr);
+  if(row.Status==='ENTRADA'&&dtStr)candidates.push(dtStr);
+  if(candidates.length===0)return true; // sem dado: inclui por precaução
+  // Encontra o candidato com menor timestamp completo
+  let best=null,bestMs=Infinity;
+  for(const s of candidates){
+    const ms=_parseDT(s);
+    if(ms&&ms<bestMs){bestMs=ms;best=s;}
+  }
+  if(!best)return true;
+  const d=parseDate(best.substring(0,10));
   if(!d)return true;
   const today=new Date();today.setHours(0,0,0,0);
   if(d.getTime()<today.getTime())return true;  // entrou antes de hoje → inclui
   if(d.getTime()>today.getTime())return true;  // data futura → inclui
-  // Entrou HOJE: verifica hora
-  const time=pe.length>10?pe.substring(11,16):'';
+  const time=best.length>10?best.substring(11,16):'';
   if(!time)return true; // sem hora → inclui por precaução
   const hh=parseInt(time.split(':')[0])||0;
   return hh<10; // antes das 10h → inclui; >= 10h → exclui (false)
@@ -2173,10 +2196,10 @@ function openSlaDrawer(type){
       filtered=rows.filter(r=>{
         const d=dDiff(r.Previsao);
         if(d===null)return false;
-        if((r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP')&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r))&&entraNoSlaHoje(r))return true;
-        if(r.Status==='CUSTODIA'&&_venceHoje(r)&&entraNoSlaHoje(r))return true;
-        if(isPending(r)&&d>0)return true; // vencidas: regra 10h não se aplica
-        if(isPending(r)&&d===0&&entraNoSlaHoje(r))return true; // vencHoje: aplica regra
+        if(!entraNoSlaHoje(r))return false; // regra 10h global
+        if((r.Status==='ENTREGUE'||r.Status==='ENTREGUE NO PICKUP')&&inSLA(r)&&(_isToday(r.DtEvento)||_venceHoje(r)))return true;
+        if(r.Status==='CUSTODIA'&&_venceHoje(r))return true;
+        if(isPending(r)&&d>=0)return true; // vencidas + vencem hoje (regra 10h já aplicada acima)
         return false;
       });
       title='Previsto Hoje';break;
@@ -2187,7 +2210,7 @@ function openSlaDrawer(type){
       filtered=rows.filter(r=>r.Status==='CUSTODIA'&&_venceHoje(r)&&entraNoSlaHoje(r));
       title='Ocorrências (Custódia SLA Dia)';break;
     case'venc':
-      filtered=rows.filter(r=>{const d=dDiff(r.Previsao);return d!==null&&d>0&&isPending(r);});
+      filtered=rows.filter(r=>{const d=dDiff(r.Previsao);return d!==null&&d>0&&isPending(r)&&entraNoSlaHoje(r);});
       title='Vencidas';break;
     case'vhoje':
       filtered=rows.filter(r=>_venceHoje(r)&&isPending(r)&&entraNoSlaHoje(r));
@@ -2196,7 +2219,7 @@ function openSlaDrawer(type){
       filtered=rows.filter(r=>{
         const d=dDiff(r.Previsao);
         if(d===null||!isPending(r))return false;
-        return d>0||(d===0&&entraNoSlaHoje(r)); // vencidas sempre; vencHoje aplica regra
+        return d>=0&&entraNoSlaHoje(r); // vencidas + vencem hoje, ambas com regra 10h
       });
       title='Faltam (Pendentes no prazo)';break;
     default:return;
