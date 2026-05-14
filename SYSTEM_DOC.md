@@ -2,7 +2,7 @@
 
 > **Fonte da verdade do sistema.** Este documento descreve a arquitetura, regras de negócio, lógica crítica e convenções do GestãoEntregas. Deve ser atualizado a cada mudança estrutural relevante.
 
-**Versão do documento:** 2026-05-13 (rev2)  
+**Versão do documento:** 2026-05-13 (rev3)  
 **Repositório:** https://github.com/teleslog/GestaoJadlog.git (branch `main`)  
 **Deploy:** https://web-production-1614e.up.railway.app  
 **Diretório local:** `C:\Users\André\Downloads\cloud_api\`
@@ -138,6 +138,7 @@ O `merge_incremental` é o caminho crítico de desempenho: ~3-5s independente do
 - Em conflito, vence o registro com `Dt Evento` mais recente
 - Se o novo não tem `Dt Evento`, mantém o existente (conservador)
 - `__primeira_entrada` é preservada: nunca sobrescrita com uma data posterior
+- **Proxy PE** (2026-05-13): novos códigos sem PE após `nova_pe` recebem `Dt Evento` como proxy — ver seção 3.3
 
 ### 2.3 Frontend (`GestãoEntregas.html`)
 
@@ -257,6 +258,17 @@ def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
 
 O resultado é injetado como campo `__primeira_entrada` em cada linha antes de servir ao frontend.
 
+#### Proxy PE para remessas sem evento ENTRADA
+
+Remessas que nunca aparecem com `Status=ENTRADA` em nenhum snapshot (ex.: chegam diretamente como EM ROTA) jamais teriam `__primeira_entrada` definida por `_compute_primeira_entrada`. Sem PE, o fallback `if(!pe)return true` em `entraNoSlaHoje` as incluía incorretamente no SLA.
+
+**Solução (2026-05-13):** ambos os caminhos de carga aplicam proxy:
+
+- **`merge_incremental`** (upload): para **novos códigos** (primeira aparição no cache) sem PE após `nova_pe`, usa o `Dt Evento` do novo arquivo como proxy.
+- **`_read_and_merge`** (startup / `refresh_all`): após injetar `pe_map`, calcula o **menor `Dt Evento` histórico** por código (de todos os arquivos) e usa como proxy para os que ainda estão sem PE.
+
+Essa cobertura dupla garante que um código chegado hoje após 10h — independente de como entrou no cache — tenha `__primeira_entrada` preenchida e seja corretamente excluído do SLA.
+
 #### Campo `PrimeiraEntrada` (frontend)
 
 Mapeado de `r['__primeira_entrada']` em `parseOp()`. O campo é protegido em `mergeOp()` para não ser sobrescrito por uma atualização que não contenha o evento de ENTRADA.
@@ -322,17 +334,24 @@ A regra se aplica a todos os componentes do SLA do dia:
 
 Exibido na pill **Entregador** da tabela Remessas do Dashboard.
 
-**Base de cálculo:** remessas do coorte SLA do dia — `entraNoSlaHoje(r) && dDiff(r.Previsao) === 0`.
+**Base de cálculo:** `baseHoje` (d=0, entraNoSlaHoje) + `baseVencPend` (d>0, pendentes vencidas).
 
-| Coluna        | Definição                                                |
-|---------------|----------------------------------------------------------|
-| Previsto Hoje | Total de remessas do entregador no coorte SLA do dia     |
-| Entregues     | ENTREGUE ou ENTREGUE NO PICKUP                           |
-| Faltam        | EM ROTA, EM ROTA PICKUP ou ENTRADA (pendentes)           |
-| Custódia      | CUSTODIA                                                 |
-| SLA%          | `round(entregues / previsto * 100)` — 0 se previsto = 0  |
+```
+PREVISTO = vencidas reais + vencendo hoje reais
+         = baseVencPend.length + baseHoje.length
+```
+
+| Coluna        | Definição                                                                      |
+|---------------|--------------------------------------------------------------------------------|
+| Previsto      | Total `baseHoje + baseVencPend` — inclui vencidas pendentes no denominador     |
+| Entregues     | ENTREGUE ou ENTREGUE NO PICKUP dentro de `baseHoje`                            |
+| Faltam        | Pendentes em `baseHoje` + todos de `baseVencPend`                              |
+| Custódia      | CUSTODIA dentro de `baseHoje`                                                  |
+| SLA%          | `round(entregues / previsto * 100)` — 0 se previsto = 0                        |
 
 Ordenação: menor SLA primeiro, depois mais faltam.
+
+> **Por que incluir vencidas no previsto:** remessas com prazo passado que ainda estão pendentes são responsabilidade do entregador e devem compor o denominador do SLA. Antes desta correção (2026-05-13), `Previsto` mostrava apenas as do dia (d=0), ignorando as atrasadas.
 
 O nome do entregador é resolvido por `_entrNome(r)` = `(r.Rota || r.Entr || '').trim() || 'Sem entregador'`.
 
@@ -370,7 +389,7 @@ function calcRisco(s) {
 
 Modal fullscreen (96vw × 94vh) ativado ao clicar em uma linha da tabela Entregador. Centrado na tela com animação fade+slide e border-radius.
 
-> **Visão operacional de ação imediata:** o painel lista APENAS remessas que afetam o SLA (`entraNoSlaHoje(r) && dDiff(r.Previsao) <= 0`). Remessas futuras ou fora do coorte SLA não aparecem.
+> **Visão operacional de ação imediata:** o painel lista APENAS remessas que afetam o SLA. Remessas futuras (d<0) não aparecem.
 
 #### Estrutura do modal
 
@@ -380,49 +399,61 @@ Modal fullscreen (96vw × 94vh) ativado ao clicar em uma linha da tabela Entrega
 ├──────────────────────────────────────────────────────────┤
 │ PREVISTO │ ENTREGUES │ FALTAM │ CUSTÓDIA │ SLA%           │ ← stats grid (5 cols)
 ├──────────────────────────────────────────────────────────┤
-│ PROGRESSO SLA  ████░░░░░░  141 de 456                    │ ← barra de progresso
+│ PROGRESSO SLA  ████░░░░░░  X de Y entregues              │ ← barra de progresso
 ├──────────────────────────────────────────────────────────┤
-│ VENCENDO HOJE (N remessas)                               │ ← d=0, pendentes, SLA
+│ VENCENDO HOJE (N remessas)                               │ ← baseHoje, pendentes
 │  Código | Cidade | Bairro | Dest. | Status | ...         │
 ├──────────────────────────────────────────────────────────┤
-│ VENCIDAS (N remessas)                                    │ ← d<0, pendentes, SLA
+│ VENCIDAS (N remessas)                                    │ ← baseVencPend (d>0)
 ├──────────────────────────────────────────────────────────┤
-│ ENTREGUES (N remessas)                                   │ ← entregues dentro SLA
+│ ENTREGUES (N remessas)                                   │ ← baseHoje, entregues
 ├──────────────────────────────────────────────────────────┤
-│ CUSTÓDIA (N remessas)                                    │ ← custódia dentro SLA
+│ CUSTÓDIA (N remessas)                                    │ ← baseHoje, custódia
 ├──────────────────────────────────────────────────────────┤
-│ TRAVADAS (N remessas)                                    │ ← travadas dentro SLA
+│ TRAVADAS (N remessas)                                    │ ← baseTrav (d>0, TRAVADO)
 └──────────────────────────────────────────────────────────┘
 ```
 
-#### Filtro base (`slaRows`)
+#### Bases de dados por grupo de seções
+
+O drawer usa **três bases separadas** para evitar contaminação entre coortes:
 
 ```javascript
-// Todas as seções são derivadas de slaRows — sem acesso a remessas fora do SLA
-const slaRows = dashRows.filter(r =>
-    _entrNome(r) === entr &&
-    entraNoSlaHoje(r) &&
-    dDiff(r.Previsao) <= 0
+// Coorte do dia: vence hoje + regra 10h (Entregues, Custódia, Vencendo Hoje)
+const baseHoje = dashRows.filter(r =>
+    _entrNome(r) === entr && entraNoSlaHoje(r) && dDiff(r.Previsao) === 0
+);
+
+// Vencidas pendentes: prazo passado, ainda não entregues (sem regra 10h)
+const baseVencPend = dashRows.filter(r =>
+    _entrNome(r) === entr && dDiff(r.Previsao) > 0 && isPend(r)
+);
+
+// Travadas vencidas
+const baseTrav = dashRows.filter(r =>
+    _entrNome(r) === entr && dDiff(r.Previsao) > 0 && isTrav(r)
 );
 ```
 
+> **Por que bases separadas:** usar `slaRows` unificada (d<=0) incluía remessas entregues com prazo semanas atrás na seção "Entregues", inflando a contagem. A separação garante que Entregues e Custódia mostram apenas o coorte do dia, enquanto Vencidas lista exclusivamente pendentes atrasadas.
+
 #### Fonte de dados por seção
 
-| Seção          | Filtro sobre `slaRows`                          | Função Dias     |
-|----------------|--------------------------------------------------|-----------------|
-| Vencendo Hoje  | `dDiff(r.Previsao) === 0 && isPend(r)`           | `dc(r.Dias, r.Status)` |
-| Vencidas       | `dDiff(r.Previsao) < 0 && isPend(r)`             | `dc(r.Dias, r.Status)` |
-| Entregues      | `isEnt(r)` (ENTREGUE ou ENTREGUE NO PICKUP)      | `dc(r.Dias, r.Status)` |
-| Custódia       | `isCust(r)` (CUSTODIA)                           | `dc(r.Dias, r.Status)` |
-| Travadas       | `isTrav(r)` (TRAVADO)                            | `dcTrav(r)` (DtEvento) |
+| Seção          | Base           | Filtro adicional              | Função Dias            |
+|----------------|----------------|-------------------------------|------------------------|
+| Vencendo Hoje  | `baseHoje`     | `isPend(r)`                   | `dc(r.Dias, r.Status)` |
+| Vencidas       | `baseVencPend` | (já filtrado)                 | `dc(r.Dias, r.Status)` |
+| Entregues      | `baseHoje`     | `isEnt(r)`                    | `dc(r.Dias, r.Status)` |
+| Custódia       | `baseHoje`     | `isCust(r)`                   | `dc(r.Dias, r.Status)` |
+| Travadas       | `baseTrav`     | (já filtrado)                 | `dcTrav(r)` (DtEvento) |
 
-#### Export Excel do painel (`exportEntrDrawerCurrent`)
+#### Export Excel do drawer (`exportEntrDrawerCurrent`)
 
-Botão **⬇ Excel** no cabeçalho do modal. Exporta somente remessas SLA do entregador aberto.
+Botão **⬇ Excel** no cabeçalho do modal. Exporta somente remessas SLA do entregador aberto, usando as mesmas três bases do drawer.
 
-- Aba **Remessas SLA**: todas as `slaRows` com colunas:
+- Aba **Remessas SLA**: `baseHoje` + `baseVencPend` + `baseTrav` com colunas:
   `Tipo SLA | Código | Cidade | Bairro | Destinatário | Status | Dt Evento | Previsão | Entregador/Rota | Dias`
-- Coluna **Tipo SLA**: `"Vencida"` (d<0) ou `"Vence Hoje"` (d=0)
+- Coluna **Tipo SLA**: `"Vence Hoje"` (baseHoje), `"Vencida"` (baseVencPend), `"Travada"` (baseTrav)
 - Aba **Resumo**: uma linha com `Entregador | SLA% | Previsto | Entregues | Faltam | Custódia | Risco`
 - Arquivo: `Entregador_{nome}_{data}.xlsx`
 
@@ -614,8 +645,11 @@ Verificar todos os pontos de uso de `entraNoSlaHoje`:
 ```
 calcM()               → vencHoje, slaEntregue, slaCustodia
 openSlaDrawer()       → prev, entr, ocorr, vhoje, falt
-calcEntregadorSummary() → base de cálculo do resumo
+calcEntregadorSummary() → baseHoje (d=0 + entraNoSlaHoje)
+openEntrDrawer()      → baseHoje (d=0 + entraNoSlaHoje)
 ```
+
+Usar `/diag/sla?codigos=...` para validar casos suspeitos em produção sem alterar código.
 
 ### 8.3 Ao adicionar nova coluna no xlsx
 
@@ -673,19 +707,45 @@ merge_incremental(tipo, key, src_path):
     3. Lock _cache
     4. Para cada row existente:
            merged[codigo] = row           # base = cache atual
-    5. Para cada row novo:
+    5. Para cada row novo (rastreia new_codes):
            if codigo em merged:
                if dt_evento_novo >= dt_evento_existente:
                    merged[codigo] = row_novo  # novo vence
                    preservar __primeira_entrada se novo for mais tardio
            else:
                merged[codigo] = row_novo      # novo código
+               new_codes.add(codigo)
     6. Calcular nova_pe = _compute_primeira_entrada(new_rows)
        Atualizar __primeira_entrada se mais antiga que a existente
-    7. Rebuild entry: linhas, dados, atualizado, arquivo
-    8. _cache[tipo][key] = nova_entry
-    9. Release lock
+    7. Proxy PE: para codigo em new_codes sem PE após nova_pe,
+       usar Dt Evento do row como __primeira_entrada
+    8. Rebuild entry: linhas, dados, atualizado, arquivo
+    9. _cache[tipo][key] = nova_entry
+   10. Release lock
 ```
+
+### 9.4a Diagnóstico SLA (`/diag/sla`)
+
+Endpoint para investigar remessas suspeitas no SLA em produção.
+
+```
+GET /diag/sla?codigos=COD1,COD2,COD3
+Requer: DIRETOR, SUPERVISAO, OPERACIONAL ou FINANCEIRO
+```
+
+Retorna para cada código encontrado no cache:
+
+| Campo              | Descrição                                              |
+|--------------------|--------------------------------------------------------|
+| `codigo`           | Código da remessa                                      |
+| `tipo` / `key`     | Localização no cache (ex: operacional/gv)              |
+| `status`           | Status atual                                           |
+| `previsao`         | Prazo de entrega                                       |
+| `ddiff`            | Dias desde o prazo (0=hoje, >0=vencida, <0=futura)     |
+| `dt_evento`        | Data do último evento                                  |
+| `primeira_entrada` | Valor de `__primeira_entrada` no cache                 |
+| `entraNoSlaHoje`   | `true`=inclusa no SLA / `false`=excluída               |
+| `motivo`           | Explicação textual da decisão (`PE hoje HH:MM >= 10h → EXCLUI`) |
 
 ### 9.4 Cálculo SLA (`calcM`)
 
@@ -776,7 +836,20 @@ fetchAll(showLoading):
 **Causa:** OneDrive cria cópias conflitantes de arquivos.  
 **Solução:** renomear o arquivo antes de enviar, ou aceitar que o sistema detecta a operação pelo conteúdo, não pelo nome.
 
-### 10.7 Remessa não aparece no SLA do dia
+### 10.7 Remessa aparece indevidamente no SLA (entrou hoje após 10h)
+
+**Diagnóstico:** acessar `/diag/sla?codigos=CODIGO` e verificar o campo `primeira_entrada` e `motivo`.
+
+**Causas possíveis:**
+
+| Causa | Sintoma no `/diag/sla` | Solução |
+|-------|------------------------|---------|
+| `__primeira_entrada` vazio | `"primeira_entrada": "(vazio)"`, `motivo: "PE vazia → fallback true"` | Proxy não foi aplicado — verificar se o código entrou via `refresh_all` antes do fix de 2026-05-13. Aguardar próximo `refresh_all` (300s) ou upload. |
+| PE com data anterior a hoje | `motivo: "PE DD/MM < hoje → inclui"` | Correto — remessa entrou antes de hoje e deve compor o SLA. |
+| PE hoje < 10h | `motivo: "PE hoje HH:MM < 10h → inclui"` | Correto — entrou antes das 10h. |
+| PE hoje ≥ 10h | `motivo: "PE hoje HH:MM >= 10h → EXCLUI"` | Correto — deve estar excluída. Se ainda aparece no painel, verificar se `entraNoSlaHoje` está sendo chamado naquele ponto. |
+
+### 10.8 Remessa não aparece no SLA do dia
 
 **Verificar em ordem:**
 1. `dDiff(r.Previsao)` = 0? (prazo = hoje)
@@ -784,7 +857,7 @@ fetchAll(showLoading):
 3. Status é elegível? (ENTREGUE, EM ROTA, ENTRADA, CUSTODIA)
 4. Operação correta? (`Hist. ultimo ponto` bate com a operação selecionada)
 
-### 10.8 Drawer do Entregador vazio
+### 10.9 Drawer do Entregador vazio
 
 **Causa provável:** `_entrDetailRows` está vazio porque `calcEntregadorSummary` ainda não foi chamado (pill Entregador nunca foi clicada nessa sessão).  
 **Solução:** o drawer deve ser aberto apenas através da tabela da pill Entregador (nunca diretamente via URL ou programaticamente sem passar pelo `filterDash`).
@@ -820,4 +893,4 @@ fetchAll(showLoading):
 ---
 
 *Documento mantido por: André Teles / equipe de desenvolvimento*  
-*Última atualização: 2026-05-13 (rev2) — commit `423d7f7`*
+*Última atualização: 2026-05-13 (rev3) — commits `ba23b20` → `48c8afd`*
