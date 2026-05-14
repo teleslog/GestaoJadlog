@@ -663,9 +663,8 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
             merged[codigo]["__primeira_entrada"] = pe_str
 
     # Proxy PE: para códigos sem __primeira_entrada (sem nenhum evento ENTRADA nos arquivos),
-    # usa Dt Evento do estado atual (arquivo mais recente). Isso captura remessas que entraram
-    # hoje como EM ROTA direto (sem scan de ENTRADA). Se o DtEvento mais recente for >= 10h,
-    # entraNoSlaHoje excluirá corretamente.
+    # usa Dt Evento do estado atual (arquivo mais recente). Marcado como __pe_proxy=True para
+    # que merge_incremental não o confunda com PE real de ENTRADA ao restaurar pe_old.
     for codigo, row in merged.items():
         if codigo.startswith("__nk_"):
             continue
@@ -673,6 +672,7 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
             dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
             if dt:
                 row["__primeira_entrada"] = dt.strftime("%d/%m/%Y %H:%M:%S")
+                row["__pe_proxy"] = True   # aproximação — não é scan de ENTRADA real
 
     return list(merged.values())
 
@@ -879,9 +879,12 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                 if dt_new is None or (dt_ex is not None and dt_ex > dt_new):
                     pass  # mantém existente — evento mais recente no cache
                 else:
-                    pe_old = ex.get("__primeira_entrada", "")  # preserva antes de sobrescrever
+                    pe_old = ex.get("__primeira_entrada", "")
+                    pe_old_is_proxy = ex.get("__pe_proxy", False)
                     merged[codigo] = row
-                    if pe_old:
+                    # Só restaura pe_old se for PE real (de scan ENTRADA), nunca proxy.
+                    # Proxy de DtEvento não pode bloquear um ENTRADA real que chega depois.
+                    if pe_old and not pe_old_is_proxy:
                         merged[codigo]["__primeira_entrada"] = pe_old
                     rows_atualizadas += 1
 
@@ -893,29 +896,34 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
             if codigo not in merged:
                 continue
             existing_pe_str = merged[codigo].get("__primeira_entrada", "")
+            existing_is_proxy = merged[codigo].get("__pe_proxy", False)
             if not existing_pe_str:
                 merged[codigo]["__primeira_entrada"] = pe_str
+                merged[codigo]["__pe_proxy"] = False
             else:
                 existing_pe = _parse_dt_evento(existing_pe_str)
                 new_pe = _parse_dt_evento(pe_str)
                 if new_pe and new_pe >= today_midnight:
-                    # Nova PE é de hoje: vence PE histórica; se cache já tem PE de hoje, mantém a mais antiga
-                    if not existing_pe or existing_pe < today_midnight or new_pe < existing_pe:
+                    # PE real de hoje: vence PE histórica OU proxy de qualquer hora
+                    # Se existing é real de hoje, mantém a mais antiga (primeiro scan real do dia)
+                    if not existing_pe or existing_pe < today_midnight or existing_is_proxy or new_pe < existing_pe:
                         merged[codigo]["__primeira_entrada"] = pe_str
+                        merged[codigo]["__pe_proxy"] = False
                 else:
-                    # Nova PE é histórica: só atualiza se for mais antiga que a existente
+                    # PE histórica real: só atualiza se for mais antiga que a existente
                     if new_pe and existing_pe and new_pe < existing_pe:
                         merged[codigo]["__primeira_entrada"] = pe_str
+                        merged[codigo]["__pe_proxy"] = False
 
         # Proxy PE para novos códigos sem __primeira_entrada após nova_pe:
-        # remessas que chegaram hoje como EM ROTA (sem ENTRADA visível no snapshot)
-        # usam Dt Evento como melhor aproximação disponível para a regra das 10h.
-        # Aplica APENAS a códigos novos — existentes no cache (entraram antes) ficam intactos.
+        # Aplica APENAS a códigos novos — existentes no cache ficam intactos.
+        # Marcado como __pe_proxy=True para não bloquear ENTRADA real futura.
         for codigo in new_codes:
             if not merged[codigo].get("__primeira_entrada", ""):
                 dt_ev = _parse_dt_evento(str(merged[codigo].get("Dt Evento", "")))
                 if dt_ev:
                     merged[codigo]["__primeira_entrada"] = dt_ev.strftime("%d/%m/%Y %H:%M:%S")
+                    merged[codigo]["__pe_proxy"] = True
 
         rows_total = len(merged)
         _cache[tipo][key] = _build_entry(tipo, key, src_path, list(merged.values()))
