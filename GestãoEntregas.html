@@ -1146,15 +1146,9 @@ function mergeOp(newRows,opIdx){
       const changed=ex.Status!==row.Status||ex.DtEvento!==row.DtEvento;
       const prevPE=ex.PrimeiraEntrada;
       Object.assign(ex,row);
-      // PE = MIN(prev, novo). Primeira entrada operacional é fato passado:
-      // jamais substituir uma PE mais antiga por uma mais nova; jamais limpar.
-      const newPE=row.PrimeiraEntrada;
-      if(prevPE&&newPE){
-        const a=_parseDT(prevPE),b=_parseDT(newPE);
-        ex.PrimeiraEntrada=(a&&b)?(a<=b?prevPE:newPE):(prevPE||newPE);
-      }else if(prevPE&&!newPE){
-        ex.PrimeiraEntrada=prevPE;
-      }
+      // Backend é a fonte de verdade da PE (já aplica MIN + filtro Hist=nossa op).
+      // Aqui só protegemos contra ser limpada: se o novo vier vazio, mantém o anterior.
+      if(!ex.PrimeiraEntrada&&prevPE)ex.PrimeiraEntrada=prevPE;
       if(changed){
         (delta[row.Codigo]=delta[row.Codigo]||[]).push({status:row.Status,dtEvento:row.DtEvento,loadedAt:now,opIdx});
         updated++;

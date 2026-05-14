@@ -1503,6 +1503,45 @@ async def diag_sla(
             "nao_encontrados": list(not_found)}
 
 
+async def _do_rebuild_cache(admin_login: str) -> dict:
+    """Rebuild completo do _cache lendo tudo do disco. Bloqueia uploads concorrentes."""
+    log.info(f"[admin] {admin_login} → rebuild-cache iniciado")
+    _t = time.perf_counter()
+    await refresh_all()
+    elapsed = time.perf_counter() - _t
+    async with _cache_lock:
+        ops_state = []
+        for tipo in TIPOS:
+            for key in OPS:
+                e = _cache.get(tipo, {}).get(key, {})
+                ops_state.append({
+                    "tipo": tipo, "key": key,
+                    "op": e.get("op"), "arquivo": e.get("arquivo"),
+                    "linhas": e.get("linhas", 0),
+                    "atualizado": e.get("atualizado"), "erro": e.get("erro"),
+                })
+    log.info(f"[admin] rebuild-cache concluído em {elapsed:.2f}s")
+    return {
+        "ok": True,
+        "elapsed_seconds": round(elapsed, 2),
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "operacoes": ops_state,
+    }
+
+
+@app.post("/admin/rebuild-cache")
+async def admin_rebuild_cache_post(admin: User = Depends(_require_admin)):
+    """Força refresh_all do zero: relê todos arquivos de /data e recalcula PE.
+    Útil após deploy, mudança de regra, ou suspeita de inconsistência no cache."""
+    return await _do_rebuild_cache(admin.login)
+
+
+@app.get("/admin/rebuild-cache")
+async def admin_rebuild_cache_get(admin: User = Depends(_require_admin)):
+    """Alias GET de POST /admin/rebuild-cache (facilita chamada manual via browser)."""
+    return await _do_rebuild_cache(admin.login)
+
+
 @app.get("/status")
 async def status(user: User = Depends(_get_current_user)):
     async with _cache_lock:
