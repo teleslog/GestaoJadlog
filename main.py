@@ -538,11 +538,16 @@ def _parse_dt_evento(s: str) -> datetime | None:
 
 def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
     """
-    Varre uma lista de linhas brutas do xlsx (formato log de eventos) e retorna
-    {codigo: 'dd/mm/yyyy HH:MM:SS'} com o MENOR DtEvento onde Status='ENTRADA'.
-    Usado para preencher '__primeira_entrada' — base da regra das 10h no frontend.
+    Varre uma lista de linhas brutas do xlsx e retorna {codigo: 'dd/mm/yyyy HH:MM:SS'}
+    com o valor de __primeira_entrada para a regra das 10h:
+      - Se existe ENTRADA HOJE: usa a mais recente de hoje (detecta re-rota após 10h).
+      - Se existe ENTRADA só no passado: usa a mais antiga histórica.
+    Garante que re-rotas com ENTRADA hoje após 10h sejam corretamente excluídas do SLA.
     """
-    primeira: dict[str, datetime] = {}
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_entrada: dict[str, datetime] = {}   # mais recente ENTRADA de hoje
+    hist_entrada:  dict[str, datetime] = {}   # mais antiga ENTRADA histórica
+
     for row in rows:
         codigo = str(row.get("Codigo", "")).strip()
         if not codigo:
@@ -552,9 +557,20 @@ def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
         dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
         if dt is None:
             continue
-        if codigo not in primeira or dt < primeira[codigo]:
-            primeira[codigo] = dt
-    return {c: dt.strftime("%d/%m/%Y %H:%M:%S") for c, dt in primeira.items()}
+        if dt >= today:
+            if codigo not in today_entrada or dt > today_entrada[codigo]:
+                today_entrada[codigo] = dt
+        else:
+            if codigo not in hist_entrada or dt < hist_entrada[codigo]:
+                hist_entrada[codigo] = dt
+
+    result: dict[str, str] = {}
+    for codigo, dt in today_entrada.items():
+        result[codigo] = dt.strftime("%d/%m/%Y %H:%M:%S")
+    for codigo, dt in hist_entrada.items():
+        if codigo not in result:
+            result[codigo] = dt.strftime("%d/%m/%Y %H:%M:%S")
+    return result
 
 
 def _read_xlsx(path: Path) -> list[dict]:
@@ -636,29 +652,25 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
         except Exception as exc:
             log.error(f"[merge] {path.name}: {exc}")
 
-    # Injeta PE a partir de eventos ENTRADA (mais preciso)
+    # Injeta PE a partir de eventos ENTRADA (mais preciso).
+    # _compute_primeira_entrada agora retorna a ENTRADA mais recente de HOJE (se existir),
+    # ou a mais antiga histórica — cobre re-rotas que tiveram ENTRADA hoje após 10h.
     pe_map = _compute_primeira_entrada(all_rows_for_pe)
     for codigo, pe_str in pe_map.items():
         if codigo in merged:
             merged[codigo]["__primeira_entrada"] = pe_str
 
-    # Proxy PE: para códigos sem __primeira_entrada, usa o menor Dt Evento histórico.
-    # Cobre remessas que nunca aparecem como ENTRADA em nenhum snapshot (ex: EM ROTA
-    # desde a primeira captura). Sem isso, PE ficaria '' e o fallback de entraNoSlaHoje
-    # incluiria incorretamente remessas que entraram hoje após 10h.
-    earliest: dict[str, datetime] = {}
-    for row in all_rows_for_pe:
-        codigo = str(row.get("Codigo", "")).strip()
-        if not codigo:
+    # Proxy PE: para códigos sem __primeira_entrada (sem nenhum evento ENTRADA nos arquivos),
+    # usa Dt Evento do estado atual (arquivo mais recente). Isso captura remessas que entraram
+    # hoje como EM ROTA direto (sem scan de ENTRADA). Se o DtEvento mais recente for >= 10h,
+    # entraNoSlaHoje excluirá corretamente.
+    for codigo, row in merged.items():
+        if codigo.startswith("__nk_"):
             continue
-        dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
-        if dt is None:
-            continue
-        if codigo not in earliest or dt < earliest[codigo]:
-            earliest[codigo] = dt
-    for codigo, dt in earliest.items():
-        if codigo in merged and not merged[codigo].get("__primeira_entrada", ""):
-            merged[codigo]["__primeira_entrada"] = dt.strftime("%d/%m/%Y %H:%M:%S")
+        if not row.get("__primeira_entrada", ""):
+            dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
+            if dt:
+                row["__primeira_entrada"] = dt.strftime("%d/%m/%Y %H:%M:%S")
 
     return list(merged.values())
 
@@ -871,8 +883,10 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                         merged[codigo]["__primeira_entrada"] = pe_old
                     rows_atualizadas += 1
 
-        # Injeta/atualiza __primeira_entrada com dados do novo arquivo (regra das 10h)
+        # Injeta/atualiza __primeira_entrada com dados do novo arquivo (regra das 10h).
+        # _compute_primeira_entrada retorna ENTRADA mais recente de HOJE (ou mais antiga histórica).
         nova_pe = _compute_primeira_entrada(new_rows)
+        today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         for codigo, pe_str in nova_pe.items():
             if codigo not in merged:
                 continue
@@ -882,8 +896,14 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
             else:
                 existing_pe = _parse_dt_evento(existing_pe_str)
                 new_pe = _parse_dt_evento(pe_str)
-                if new_pe and existing_pe and new_pe < existing_pe:
-                    merged[codigo]["__primeira_entrada"] = pe_str
+                if new_pe and new_pe >= today_midnight:
+                    # Nova PE é de hoje: vence PE histórica ou PE mais antiga de hoje
+                    if not existing_pe or existing_pe < today_midnight or new_pe > existing_pe:
+                        merged[codigo]["__primeira_entrada"] = pe_str
+                else:
+                    # Nova PE é histórica: só atualiza se for mais antiga que a existente
+                    if new_pe and existing_pe and new_pe < existing_pe:
+                        merged[codigo]["__primeira_entrada"] = pe_str
 
         # Proxy PE para novos códigos sem __primeira_entrada após nova_pe:
         # remessas que chegaram hoje como EM ROTA (sem ENTRADA visível no snapshot)

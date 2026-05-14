@@ -1784,6 +1784,12 @@ function parseDate(s){
   if(m2)return new Date(+m2[1],+m2[2]-1,+m2[3]);
   return null;
 }
+// Parser datetime completo DD/MM/YYYY HH:MM:SS → ms (usado no dedup de getRows)
+function _parseDT(s){
+  if(!s)return 0;
+  const m=String(s).trim().match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);
+  return m?new Date(+m[3],+m[2]-1,+m[1],+(m[4]||0),+(m[5]||0),+(m[6]||0)).getTime():0;
+}
 function dDiff(s){
   const d=parseDate(s);if(!d)return null;
   const t=new Date();t.setHours(0,0,0,0);
@@ -1923,9 +1929,11 @@ function getRows(){
     opMaps.forEach(m=>m.forEach((row,codigo)=>{
       const ex=dedup.get(codigo);
       if(!ex){dedup.set(codigo,row);return;}
-      const dEx=parseDate(String(ex.DtEvento||'').substring(0,10));
-      const dNew=parseDate(String(row.DtEvento||'').substring(0,10));
-      if(dNew&&(!dEx||dNew>=dEx))dedup.set(codigo,row);
+      // Compara datetime completo (DD/MM/YYYY HH:MM:SS) para evitar que ENTRADA das 08h
+      // sobreescreva ENTREGUE das 15h do mesmo dia por comparação date-only.
+      const dEx=_parseDT(String(ex.DtEvento||''));
+      const dNew=_parseDT(String(row.DtEvento||''));
+      if(dNew&&(!dEx||dNew>dEx))dedup.set(codigo,row);
     }));
     rows=Array.from(dedup.values());
   } else {
@@ -1989,10 +1997,10 @@ function calcM(rows){
   const isPending=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
 
   // Vencidas: pendentes com prazo expirado (Dias > 0)
-  // Regra 10h não se aplica a vencidas — deadline já passou, devem ser entregues
+  // Regra 10h aplicada: entrada hoje após 10h → excluída mesmo vencida
   const vencidas=rows.filter(r=>{
     const d=dDiff(r.Previsao);
-    return d!==null&&d>0&&isPending(r);
+    return d!==null&&d>0&&isPending(r)&&entraNoSlaHoje(r);
   }).length;
 
   // Vencem hoje: pendentes com prazo hoje (Dias = 0)
@@ -2243,7 +2251,7 @@ function calcEntregadorSummary(rows){
   const isCust=r=>r.Status==='CUSTODIA';
   const isPend=r=>r.Status==='EM ROTA'||r.Status==='EM ROTA PICKUP'||r.Status==='ENTRADA';
   const baseHoje=rows.filter(r=>entraNoSlaHoje(r)&&dDiff(r.Previsao)===0&&(isEnt(r)||isCust(r)||isPend(r)));
-  const baseVencPend=rows.filter(r=>dDiff(r.Previsao)>0&&isPend(r));
+  const baseVencPend=rows.filter(r=>dDiff(r.Previsao)>0&&isPend(r)&&entraNoSlaHoje(r));
   const base=[...baseHoje,...baseVencPend];
   _entrDetailRows=base;
   const sumMap={};
@@ -2285,10 +2293,10 @@ function openEntrDrawer(entr){
   const baseHoje=dashRows.filter(r=>
     _entrNome(r)===entr&&entraNoSlaHoje(r)&&dDiff(r.Previsao)===0
   );
-  // Vencidas pendentes: overdue + ainda não entregues (sem regra 10h, SYSTEM_DOC 3.2)
+  // Vencidas pendentes: overdue + ainda não entregues + regra 10h aplicada
   // Isolado de baseHoje para não contaminar Entregues/Custódia com histórico
   const baseVencPend=dashRows.filter(r=>
-    _entrNome(r)===entr&&dDiff(r.Previsao)>0&&isPend(r)
+    _entrNome(r)===entr&&dDiff(r.Previsao)>0&&isPend(r)&&entraNoSlaHoje(r)
   );
   // Travadas vencidas
   const baseTrav=dashRows.filter(r=>
@@ -2350,7 +2358,7 @@ function exportEntrDrawerCurrent(){
     _entrNome(r)===_currentEntrDrawer&&entraNoSlaHoje(r)&&dDiff(r.Previsao)===0
   );
   const baseVencPend=dashRows.filter(r=>
-    _entrNome(r)===_currentEntrDrawer&&dDiff(r.Previsao)>0&&isPend(r)
+    _entrNome(r)===_currentEntrDrawer&&dDiff(r.Previsao)>0&&isPend(r)&&entraNoSlaHoje(r)
   );
   const baseTrav=dashRows.filter(r=>
     _entrNome(r)===_currentEntrDrawer&&dDiff(r.Previsao)>0&&isTrav(r)
@@ -2699,15 +2707,21 @@ function renderTimelineCard(codigo,events){
   });
   // 3) reordenar por dtEvento DESC; empate → loadedAt DESC
   deduped.sort((a,b)=>{const d=_pdt(b.dtEvento)-_pdt(a.dtEvento);return d!==0?d:new Date(b.loadedAt)-new Date(a.loadedAt);});
-  const timeline=deduped.map(e=>`
-    <div class="timeline-event">
-      <div class="timeline-ts" style="font-size:13px">${new Date(e.loadedAt).toLocaleString('pt-BR')}</div>
-      <div class="timeline-detail">
-        <span class="badge ${bc(e.status)}" style="font-size:11px">${e.status}</span>
-        ${e.dtEvento?`<div style="color:#888;font-size:13px">Dt Evento: ${e.dtEvento}</div>`:''}
-        <div style="color:#AAA;font-size:11px">${OPS[e.opIdx]||''}</div>
+  const timeline=deduped.map((e,i)=>{
+    const isCurr=i===0;
+    return`<div class="timeline-event" style="${isCurr?'background:#FFFBEB;border-radius:6px;padding:6px 8px;margin:-2px 0;':''}">
+      <div class="timeline-ts" style="font-size:13px;${isCurr?'font-weight:700;color:#1A1A1A':'color:#888'}">
+        ${e.dtEvento||'—'}
       </div>
-    </div>`).join('');
+      <div class="timeline-detail">
+        <span class="badge ${bc(e.status)}" style="font-size:11px${isCurr?';outline:2px solid #E5A100;outline-offset:2px':''}">
+          ${e.status}${isCurr?'&nbsp;<span style="font-size:9px;color:#888;font-weight:400">← atual</span>':''}
+        </span>
+        <div style="color:#AAA;font-size:10px">${OPS[e.opIdx]||''}</div>
+        <div style="color:#DDD;font-size:9px">snapshot: ${new Date(e.loadedAt).toLocaleString('pt-BR')}</div>
+      </div>
+    </div>`;
+  }).join('');
   return`<div class="panel" style="margin-bottom:12px">
     <div class="panel-hdr">
       <div style="display:flex;flex-direction:column;gap:4px">
