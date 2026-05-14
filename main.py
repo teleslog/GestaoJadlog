@@ -536,17 +536,21 @@ def _parse_dt_evento(s: str) -> datetime | None:
     return None
 
 
-def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
+def _compute_primeira_entrada(rows: list[dict], op_name: str | None = None) -> dict[str, str]:
     """
     Retorna {codigo: 'dd/mm/yyyy HH:MM:SS'} com o MENOR Dt Evento onde Status='ENTRADA'.
-    Sem prioridade hoje vs histórico — a primeira entrada operacional é sempre a mais antiga.
-    Re-scan posterior nunca reseta a PE: vence sempre a entrada mais antiga conhecida.
+    Filtra por Hist. ultimo ponto == op_name (se informado): impede que ENTRADAs em
+    outra torre (snapshots de quando o pacote estava em trânsito) virem PE desta op.
     """
+    op_upper = op_name.upper() if op_name else None
     primeira: dict[str, datetime] = {}
     for row in rows:
         codigo = str(row.get("Codigo", "")).strip()
         if not codigo:
             continue
+        if op_upper is not None:
+            if str(row.get("Hist. ultimo ponto", "")).strip().upper() != op_upper:
+                continue
         if str(row.get("Status", "")).strip().upper() != "ENTRADA":
             continue
         dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
@@ -608,14 +612,15 @@ def _read_xlsx(path: Path) -> list[dict]:
     return rows
 
 
-def _read_and_merge(paths: list[Path]) -> list[dict]:
+def _read_and_merge(paths: list[Path], op_name: str | None = None) -> list[dict]:
     """
     Lê todos os arquivos e mescla por coluna 'Codigo'.
     Processa do mais antigo ao mais recente: arquivo mais recente vence em conflitos.
     Garante que o total de remessas nunca diminua entre atualizações — Codigos
     que saem do relatório novo ainda ficam com o último status conhecido.
-    Injeta '__primeira_entrada' (regra das 10h): menor DtEvento com Status=ENTRADA por Codigo.
-    Proxy: códigos sem ENTRADA usam menor Dt Evento histórico como aproximação.
+    Injeta '__primeira_entrada': MIN(Dt Evento) onde Status=ENTRADA E Hist=op_name.
+    Proxy: códigos sem ENTRADA na nossa torre → MIN(Dt Evento) entre linhas com
+    Hist=op_name (jamais conta Dt Evento de outras torres como aproximação).
     """
     merged: dict[str, dict] = {}
     all_rows_for_pe: list[dict] = []
@@ -636,22 +641,25 @@ def _read_and_merge(paths: list[Path]) -> list[dict]:
         except Exception as exc:
             log.error(f"[merge] {path.name}: {exc}")
 
-    # Injeta PE real (MIN Dt Evento onde Status=ENTRADA, em qualquer arquivo).
-    pe_map = _compute_primeira_entrada(all_rows_for_pe)
+    # PE real: MIN Dt Evento onde Status=ENTRADA E Hist=nossa op.
+    pe_map = _compute_primeira_entrada(all_rows_for_pe, op_name)
     for codigo, pe_str in pe_map.items():
         if codigo in merged:
             merged[codigo]["__primeira_entrada"] = pe_str
             merged[codigo]["__pe_proxy"] = False
 
-    # Proxy PE: para códigos sem nenhum evento ENTRADA em nenhum arquivo,
-    # usa o MENOR Dt Evento histórico em qualquer arquivo (não o mais recente).
-    # Sem esse mínimo, códigos que entraram em transferência ontem ficariam
-    # com proxy=hoje (Dt Evento do último estado) e seriam excluídos erradamente.
+    # Proxy PE: para códigos sem ENTRADA na nossa torre, usa MIN(Dt Evento) APENAS
+    # entre linhas com Hist=nossa op. Linhas com Hist=outra torre (em trânsito)
+    # são descartadas — não representam presença física na nossa operação.
+    op_upper = op_name.upper() if op_name else None
     earliest_dt: dict[str, datetime] = {}
     for row in all_rows_for_pe:
         codigo = str(row.get("Codigo", "")).strip()
         if not codigo:
             continue
+        if op_upper is not None:
+            if str(row.get("Hist. ultimo ponto", "")).strip().upper() != op_upper:
+                continue
         dt = _parse_dt_evento(str(row.get("Dt Evento", "")))
         if dt is None:
             continue
@@ -692,7 +700,9 @@ async def _refresh_from_paths(tipo: str, key: str, paths: list[Path]) -> dict:
     if not paths:
         return _build_entry(tipo, key, None)
     try:
-        rows = _read_and_merge(paths)
+        # Filtro Hist só vale para operacional (financeiro não tem essa coluna).
+        op_name = OPS[key][0] if tipo == "operacional" else None
+        rows = _read_and_merge(paths, op_name)
         newest = paths[0]
         log.info(f"[load] {tipo}/{key} — {len(paths)} arquivo(s) → {len(rows)} linhas mescladas")
         return _build_entry(tipo, key, newest, rows)
@@ -883,9 +893,13 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                         merged[codigo]["__primeira_entrada"] = pe_old
                         merged[codigo]["__pe_proxy"] = pe_old_is_proxy
 
+        # Filtro Hist só vale para operacional (financeiro não tem essa coluna).
+        op_name = OPS[key][0] if tipo == "operacional" else None
+        op_upper = op_name.upper() if op_name else None
+
         # Atualiza __primeira_entrada com evidência do novo arquivo.
-        # Regra: PE = MIN das ENTRADAs reais observadas. Real sempre vence proxy.
-        nova_pe = _compute_primeira_entrada(new_rows)
+        # PE = MIN das ENTRADAs reais NA NOSSA TORRE. Real sempre vence proxy.
+        nova_pe = _compute_primeira_entrada(new_rows, op_name)
         for codigo, pe_str in nova_pe.items():
             if codigo not in merged:
                 continue
@@ -904,15 +918,16 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
                 merged[codigo]["__primeira_entrada"] = pe_str
                 merged[codigo]["__pe_proxy"] = False
 
-        # Proxy PE: aplica MIN(Dt Evento) do novo arquivo a TODOS os códigos sem PE
-        # (novos OU existentes que perderam PE em snapshot anterior). Existentes com
-        # PE real ou proxy menor preservam o valor; só preenche o que estiver vazio
-        # ou substitui proxy maior por proxy menor.
+        # Proxy PE: MIN(Dt Evento) APENAS entre linhas com Hist=nossa op.
+        # Linhas com Hist=outra torre (em trânsito) não contam — não estavam aqui.
         new_min_dt: dict[str, datetime] = {}
         for row in new_rows:
             codigo = str(row.get("Codigo", "")).strip()
             if not codigo:
                 continue
+            if op_upper is not None:
+                if str(row.get("Hist. ultimo ponto", "")).strip().upper() != op_upper:
+                    continue
             dt_ev = _parse_dt_evento(str(row.get("Dt Evento", "")))
             if dt_ev is None:
                 continue
