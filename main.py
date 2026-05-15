@@ -1985,6 +1985,156 @@ async def admin_rebuild_cache_get(admin: User = Depends(_require_admin)):
     return await _do_rebuild_cache(admin.login)
 
 
+# ── AUDITORIA VISUAL SLA (DIRETOR) ─────────────────────────────────────────────
+# Endpoint dedicado para a tela "Auditoria SLA". Reaproveita _diag_audit (P5)
+# em executor e adiciona pós-filtros operacionais (status, entra_no_sla,
+# apenas_suspeitas). Nunca altera o painel SLA principal.
+
+_VALID_STATUS = {"ENTREGUE", "ENTREGUE NO PICKUP", "EM ROTA", "EM ROTA PICKUP",
+                 "ENTRADA", "CUSTODIA", "TRAVADO", "TRANSFERENCIA", "EMISSAO"}
+
+
+def _parse_bool(s: str | None) -> bool | None:
+    """Retorna True/False/None de uma string flexível ('true', '1', 'sim', etc.)."""
+    if s is None:
+        return None
+    v = str(s).strip().lower()
+    if v in ("true", "1", "yes", "sim", "y", "s"):
+        return True
+    if v in ("false", "0", "no", "nao", "não", "n"):
+        return False
+    return None
+
+
+@app.get("/audit/sla")
+async def audit_sla(
+    op: str | None = None,
+    codigos: str | None = None,
+    categoria: str | None = None,
+    status: str | None = None,
+    entra_no_sla: str | None = None,
+    apenas_inconsistencias: str | None = None,
+    apenas_suspeitas: str | None = None,
+    apenas_fallback: str | None = None,
+    limit: int | None = 200,
+    offset: int | None = 0,
+    admin: User = Depends(_require_admin),
+):
+    """
+    Auditoria visual SLA — DIRETOR only.
+
+    Reaproveita /diag/sla?mode=audit (mesma regra), e adiciona:
+      - status:                filtra por Status atual (EM ROTA, ENTREGUE, etc.)
+      - entra_no_sla=true|false: só remessas que entram ou não no SLA
+      - apenas_suspeitas:      só remessas marcadas como suspeitas (PE proxy
+                               apontando dia anterior com DtEvento hoje >=10h)
+      - apenas_fallback:       só remessas com PE proxy ou sem candidato
+      - limit/offset:          paginação (default limit=200)
+
+    Resposta:
+      resumo, auditoria (com idade_cache), filtros aplicados,
+      detalhes_total_filtrado, detalhes (paginados).
+    """
+    cset = {c.strip() for c in codigos.split(",") if c.strip()} if codigos else None
+    op_key = op if (op and op in OPS) else None
+    cat_filter = categoria.upper().strip() if categoria else None
+    only_inc = bool(_parse_bool(apenas_inconsistencias))
+    only_susp = bool(_parse_bool(apenas_suspeitas))
+    only_fb = bool(_parse_bool(apenas_fallback))
+    entra_filter = _parse_bool(entra_no_sla)
+    status_filter = status.upper().strip() if status else None
+    if status_filter and status_filter not in _VALID_STATUS:
+        status_filter = None
+    lim = max(int(limit), 0) if limit else 0
+    off = max(int(offset), 0) if offset else 0
+
+    # Snapshot rápido sob lock; processamento fora.
+    async with _cache_lock:
+        cache_snap = {
+            "operacional": {
+                k: {
+                    "dados": list((_cache.get("operacional", {}).get(k) or {}).get("dados") or []),
+                    "atualizado": (_cache.get("operacional", {}).get(k) or {}).get("atualizado"),
+                    "linhas": (_cache.get("operacional", {}).get(k) or {}).get("linhas", 0),
+                    "arquivo": (_cache.get("operacional", {}).get(k) or {}).get("arquivo"),
+                    "erro": (_cache.get("operacional", {}).get(k) or {}).get("erro"),
+                }
+                for k in OPS
+            },
+            "financeiro": {},
+        }
+
+    def _run():
+        global _cache
+        saved = _cache
+        try:
+            _cache = cache_snap
+            # 1) Roda a auditoria completa com detalhes (sem paginar ainda).
+            payload = _diag_audit(
+                op_filter=op_key,
+                codigos_filter=cset,
+                include_detalhes=True,
+                categoria_filter=cat_filter,
+                apenas_inconsistencias=only_inc,
+                apenas_excluidas_10h=False,
+                limit=0, offset=0,
+            )
+            detalhes = payload["detalhes"]
+
+            # 2) Pós-filtros adicionais (não impactam resumo/auditoria).
+            if status_filter:
+                detalhes = [d for d in detalhes if d["status_atual"] == status_filter]
+            if entra_filter is not None:
+                detalhes = [d for d in detalhes if d["entrou_no_sla"] == entra_filter]
+            if only_susp:
+                susp_codes = {s["codigo"] for s in payload["auditoria"]["remessas_suspeitas_detalhe"]}
+                detalhes = [d for d in detalhes if d["codigo"] in susp_codes]
+            if only_fb:
+                detalhes = [d for d in detalhes
+                            if d["pe_proxy"] or "sem candidato" in (d.get("motivo") or "")
+                            or "não parsearam" in (d.get("motivo") or "")]
+
+            # 3) Anota a "cor" sugerida para o frontend (cálculo centralizado aqui).
+            for d in detalhes:
+                d["badge"] = _audit_badge(d)
+
+            # 4) Paginação.
+            total_after_filters = len(detalhes)
+            end = (off + lim) if lim > 0 else None
+            detalhes = detalhes[off:end]
+
+            payload["detalhes"] = detalhes
+            payload["detalhes_total_filtrado"] = total_after_filters
+            payload["filtros"] = {
+                **payload["filtros"],
+                "status": status_filter,
+                "entra_no_sla": entra_filter,
+                "apenas_suspeitas": only_susp,
+                "apenas_fallback": only_fb,
+                "limit": lim, "offset": off,
+            }
+            return payload
+        finally:
+            _cache = saved
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run)
+
+
+def _audit_badge(d: dict) -> str:
+    """Cor sugerida para a UI da auditoria visual.
+    Ordem de precedência: red > yellow > green > gray."""
+    if d.get("inconsistente"):
+        return "red"
+    motivo = (d.get("motivo") or "").lower()
+    is_fallback = bool(d.get("pe_proxy")) or "sem candidato" in motivo or "não parsearam" in motivo
+    if is_fallback:
+        return "yellow"
+    if d.get("entrou_no_sla"):
+        return "green"
+    return "gray"
+
+
 @app.get("/status")
 async def status(user: User = Depends(_get_current_user)):
     async with _cache_lock:

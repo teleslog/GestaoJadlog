@@ -290,6 +290,24 @@ tr:hover td{background:#FFF5F5;}
 .entr-tbl td{color:#1A1A1A;font-size:12px;padding:5px 16px;border-bottom:1px solid #F5F5F5;white-space:nowrap;}
 .entr-tbl-wrap{overflow-x:auto;}
 .entr-tbl tr:hover td{background:#FFF5F5;}
+
+/* ── Auditoria SLA (FASE 2) ─────────────────────────────────────────── */
+.au-card{background:#FAFAFA;border:1px solid #EEE;border-radius:6px;padding:10px 12px;text-align:center;}
+.au-card .lbl{font-size:9px;color:#888;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:4px;}
+.au-card .val{font-size:20px;font-weight:700;color:#1A1A1A;}
+.au-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle;}
+.au-dot.red{background:#CC0000;box-shadow:0 0 0 2px rgba(204,0,0,0.15);}
+.au-dot.yellow{background:#E5A100;box-shadow:0 0 0 2px rgba(229,161,0,0.15);}
+.au-dot.green{background:#22A05B;box-shadow:0 0 0 2px rgba(34,160,91,0.15);}
+.au-dot.gray{background:#999;box-shadow:0 0 0 2px rgba(153,153,153,0.15);}
+#au-tbl tbody tr.au-row-red{background:#FFF2F2;}
+#au-tbl tbody tr.au-row-yellow{background:#FFFCEC;}
+#au-tbl tbody tr.au-row-gray{background:#FAFAFA;color:#666;}
+#au-tbl tbody tr:hover td{background:#F5F5F5;}
+.au-mono{font-family:Consolas,Menlo,monospace;font-size:11px;}
+.au-pe-real{color:#22A05B;font-weight:600;}
+.au-pe-proxy{color:#E5A100;font-weight:600;}
+.au-pe-empty{color:#AAA;font-style:italic;}
 </style>
 </head>
 <body>
@@ -428,6 +446,7 @@ tr:hover td{background:#FFF5F5;}
     <div class="nav-item" id="nav-importar" onclick="nav('importar',this)" style="display:none"><span class="nav-icon">📤</span>Importar Arquivos</div>
     <div class="nav-group" id="nav-group-admin" style="display:none">Administração</div>
     <div class="nav-item" id="nav-admin" onclick="nav('admin',this)" style="display:none"><span class="nav-icon">⚙️</span>Usuários</div>
+    <div class="nav-item" id="nav-auditoria" onclick="nav('auditoria',this)" style="display:none"><span class="nav-icon">🔬</span>Auditoria SLA</div>
   </nav>
   <div class="sidebar-footer">
     <div class="clock" id="clock"></div>
@@ -530,6 +549,109 @@ tr:hover td{background:#FFF5F5;}
       </div>
       <div class="panel">
         <div id="admin-users-body"><div class="empty">Carregando...</div></div>
+      </div>
+    </div>
+
+    <!-- AUDITORIA SLA (DIRETOR) -->
+    <div class="page" id="page-auditoria">
+      <!-- Resumo -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="panel-hdr">
+          <div class="panel-title">Resumo SLA</div>
+          <div style="font-size:10px;color:#888" id="au-cache-info">—</div>
+        </div>
+        <div id="au-summary-strip" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;padding:10px 12px"></div>
+      </div>
+
+      <!-- Filtros -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="panel-hdr">
+          <div class="panel-title">Filtros de investigação</div>
+          <div style="display:flex;gap:6px">
+            <button class="hbtn" onclick="loadAuditPage()">↻ Atualizar</button>
+            <button class="hbtn" onclick="exportAuditCsv()" style="border-color:var(--green);color:var(--green)">⬇ CSV</button>
+          </div>
+        </div>
+        <div class="filters" style="flex-wrap:wrap;padding:10px 12px;gap:8px">
+          <select class="si" id="au-op">
+            <option value="">Todas as operações</option>
+            <option value="gv">GV Valadares</option>
+            <option value="itabira">Itabira</option>
+            <option value="jm">João Monlevade</option>
+            <option value="curvelo">Curvelo</option>
+          </select>
+          <select class="si" id="au-status">
+            <option value="">Todos os status</option>
+            <option>ENTREGUE</option>
+            <option>ENTREGUE NO PICKUP</option>
+            <option>EM ROTA</option>
+            <option>EM ROTA PICKUP</option>
+            <option>ENTRADA</option>
+            <option>CUSTODIA</option>
+            <option>TRAVADO</option>
+          </select>
+          <select class="si" id="au-categoria">
+            <option value="">Toda categoria SLA</option>
+            <option>VENCIDAS</option>
+            <option>VENCEM_HOJE</option>
+            <option>ENTREGUES_SLA</option>
+            <option>CUSTODIA_SLA</option>
+            <option>FORA_SLA</option>
+          </select>
+          <select class="si" id="au-entra">
+            <option value="">Entra SLA: ambos</option>
+            <option value="true">Só entra</option>
+            <option value="false">Só excluídas (regra 10h)</option>
+          </select>
+          <select class="si" id="au-badge">
+            <option value="">Todas as cores</option>
+            <option value="red">🔴 Inconsistência</option>
+            <option value="yellow">🟡 Fallback</option>
+            <option value="green">🟢 Validado</option>
+            <option value="gray">⚪ Excluído SLA</option>
+          </select>
+          <input type="text" class="di" id="au-codigos" placeholder="Códigos (CSV)" style="width:200px">
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#666">
+            <input type="checkbox" id="au-inc" style="cursor:pointer"> Só inconsistências
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#666">
+            <input type="checkbox" id="au-susp" style="cursor:pointer"> Só suspeitas
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#666">
+            <input type="checkbox" id="au-fb" style="cursor:pointer"> Só fallback
+          </label>
+          <button class="hbtn" onclick="loadAuditPage()" style="background:var(--red);color:white;border-color:var(--red)">Aplicar</button>
+        </div>
+      </div>
+
+      <!-- Tabela -->
+      <div class="panel">
+        <div class="panel-hdr">
+          <div class="panel-title" id="au-result-title">Resultados</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="hbtn" id="au-prev" onclick="auditPage(-1)" disabled>← Anterior</button>
+            <span id="au-page-info" style="font-size:11px;color:#666">—</span>
+            <button class="hbtn" id="au-next" onclick="auditPage(1)" disabled>Próxima →</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="dash-tbl" id="au-tbl">
+            <thead><tr>
+              <th></th>
+              <th>Código</th>
+              <th>Op</th>
+              <th>Status</th>
+              <th>Dt Evento</th>
+              <th>Previsão</th>
+              <th>PE</th>
+              <th>Origem PE</th>
+              <th>Entra SLA</th>
+              <th>Categoria</th>
+              <th>Motivo</th>
+            </tr></thead>
+            <tbody id="au-tb"><tr><td colspan="11" style="padding:30px;text-align:center;color:#888">Selecione filtros e clique em "Aplicar".</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -1216,11 +1338,13 @@ function _updateAuthUI(){
     sideUser.style.display=_authToken?'block':'none';
     sideUser.textContent=_authLogin+' · '+(_ROLE_LABELS[_authRole]||_authRole);
   }
-  // Diretor: Usuários
+  // Diretor: Usuários + Auditoria SLA
   const navGrpAdmin=document.getElementById('nav-group-admin');
   const navAdmin=document.getElementById('nav-admin');
+  const navAud=document.getElementById('nav-auditoria');
   if(navGrpAdmin)navGrpAdmin.style.display=isAdmin?'':'none';
   if(navAdmin)navAdmin.style.display=isAdmin?'':'none';
+  if(navAud)navAud.style.display=isAdmin?'':'none';
   // Diretor+Supervisão: Importar
   const navGrpImp=document.getElementById('nav-group-importar');
   const navImp=document.getElementById('nav-importar');
@@ -3364,6 +3488,7 @@ function nav(page,el){
     consultas:'Consultas / Histórico',despesas:'Despesas — Lançamentos',
     'sla-acumulado':'SLA Acumulado',
     admin:'Administração — Usuários',
+    auditoria:'Auditoria SLA',
     importar:'Importar Arquivos Excel',
   };
   document.getElementById('page-title').textContent=titles[page]||page;
@@ -3374,7 +3499,153 @@ function nav(page,el){
   if(page==='despesas')loadDespesas();
   if(page==='sla-acumulado')renderSlaAcumulado();
   if(page==='admin')_loadAdminUsers();
+  if(page==='auditoria')loadAuditPage();
   if(page==='importar')_loadImportStatus();
+}
+
+// ── AUDITORIA SLA (FASE 2 — DIRETOR) ──────────────────────────────────────────
+// Tela de investigação técnica do SLA. Consome /audit/sla (backend já calcula
+// tudo). Sem regra paralela no frontend; só renderiza.
+
+const AU_PAGE_SIZE = 100;
+let _auOffset = 0;
+let _auLastTotal = 0;
+
+function _auGetFilters(){
+  const op = document.getElementById('au-op').value;
+  const status = document.getElementById('au-status').value;
+  const categoria = document.getElementById('au-categoria').value;
+  const entra = document.getElementById('au-entra').value;
+  const badge = document.getElementById('au-badge').value;
+  const codigos = (document.getElementById('au-codigos').value || '').trim();
+  const inc = document.getElementById('au-inc').checked;
+  const susp = document.getElementById('au-susp').checked;
+  const fb = document.getElementById('au-fb').checked;
+  const qs = new URLSearchParams();
+  if (op) qs.set('op', op);
+  if (status) qs.set('status', status);
+  if (categoria) qs.set('categoria', categoria);
+  if (entra) qs.set('entra_no_sla', entra);
+  if (codigos) qs.set('codigos', codigos);
+  if (inc) qs.set('apenas_inconsistencias', 'true');
+  if (susp) qs.set('apenas_suspeitas', 'true');
+  if (fb) qs.set('apenas_fallback', 'true');
+  qs.set('limit', AU_PAGE_SIZE);
+  qs.set('offset', _auOffset);
+  return { qs: qs.toString(), badge };
+}
+
+async function loadAuditPage(reset = true){
+  if (reset) _auOffset = 0;
+  const tb = document.getElementById('au-tb');
+  tb.innerHTML = '<tr><td colspan="11" style="padding:30px;text-align:center;color:#888">Carregando...</td></tr>';
+  const { qs, badge } = _auGetFilters();
+  try{
+    const r = await fetch(API_BASE + '/audit/sla?' + qs, { headers: _authHeaders() });
+    if (r.status === 403){
+      tb.innerHTML = '<tr><td colspan="11" style="padding:30px;text-align:center;color:#CC0000">Acesso restrito ao Diretor.</td></tr>';
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    _renderAuditSummary(data);
+    _renderAuditTable(data, badge);
+  } catch(e){
+    tb.innerHTML = '<tr><td colspan="11" style="padding:30px;text-align:center;color:#CC0000">Erro: ' + e.message + '</td></tr>';
+  }
+}
+
+function auditPage(direction){
+  _auOffset = Math.max(0, _auOffset + direction * AU_PAGE_SIZE);
+  loadAuditPage(false);
+}
+
+function _renderAuditSummary(data){
+  const r = data.resumo || {};
+  const a = data.auditoria || {};
+  const cards = [
+    { lbl: 'Dashboard', val: (r.dashboard_total || 0).toLocaleString('pt-BR') },
+    { lbl: 'No SLA', val: (r.total_sla || 0).toLocaleString('pt-BR') },
+    { lbl: 'Vencidas', val: r.vencidas || 0 },
+    { lbl: 'Vencem hoje', val: r.vencem_hoje || 0 },
+    { lbl: 'Entregues SLA', val: r.entregues_sla || 0 },
+    { lbl: 'Custódia SLA', val: r.custodia_sla || 0 },
+    { lbl: 'SLA %', val: (r.sla_percentual || 0).toFixed(2) + '%' },
+    { lbl: 'Excluídas 10h', val: a.total_excluidas_10h || 0 },
+    { lbl: 'Inconsistências', val: a.inconsistencias || 0 },
+    { lbl: 'Suspeitas', val: a.remessas_suspeitas || 0 },
+  ];
+  document.getElementById('au-summary-strip').innerHTML =
+    cards.map(c => `<div class="au-card"><div class="lbl">${c.lbl}</div><div class="val">${c.val}</div></div>`).join('');
+  const idade = a.idade_cache_segundos;
+  const ts = a.ultima_atualizacao_cache || '—';
+  const idadeFmt = idade === null || idade === undefined ? '—' :
+    idade < 60 ? idade + 's' : Math.floor(idade / 60) + 'min ' + (idade % 60) + 's';
+  document.getElementById('au-cache-info').textContent =
+    `Cache atualizado: ${ts} · idade: ${idadeFmt}`;
+}
+
+function _renderAuditTable(data, badgeFilter){
+  let rows = data.detalhes || [];
+  if (badgeFilter) rows = rows.filter(r => r.badge === badgeFilter);
+  const total = data.detalhes_total_filtrado || 0;
+  _auLastTotal = total;
+  document.getElementById('au-result-title').textContent =
+    `Resultados — ${rows.length} de ${total.toLocaleString('pt-BR')} remessas`;
+  const totalPages = Math.max(1, Math.ceil(total / AU_PAGE_SIZE));
+  const curPage = Math.floor(_auOffset / AU_PAGE_SIZE) + 1;
+  document.getElementById('au-page-info').textContent = `Página ${curPage} de ${totalPages}`;
+  document.getElementById('au-prev').disabled = _auOffset <= 0;
+  document.getElementById('au-next').disabled = (_auOffset + AU_PAGE_SIZE) >= total;
+  if (!rows.length){
+    document.getElementById('au-tb').innerHTML =
+      '<tr><td colspan="11" style="padding:30px;text-align:center;color:#888">Nenhuma remessa corresponde aos filtros.</td></tr>';
+    return;
+  }
+  document.getElementById('au-tb').innerHTML = rows.map(r => _auRow(r)).join('');
+}
+
+function _esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function _auRow(r){
+  const badge = r.badge || 'gray';
+  const peStr = r.primeira_entrada_valida || '';
+  const peCls = !peStr ? 'au-pe-empty' : (r.pe_proxy ? 'au-pe-proxy' : 'au-pe-real');
+  const peTxt = peStr || '(vazio)';
+  const peOrigin = !peStr ? 'fallback' : (r.pe_proxy ? 'PE proxy' : 'PE real');
+  return `<tr class="au-row-${badge}">
+    <td><span class="au-dot ${badge}" title="${badge}"></span></td>
+    <td class="au-mono"><b>${_esc(r.codigo)}</b></td>
+    <td>${_esc(r.operacao)}</td>
+    <td>${_esc(r.status_atual)}</td>
+    <td class="au-mono">${_esc(r.dt_evento)}</td>
+    <td class="au-mono">${_esc(r.previsao)}</td>
+    <td class="au-mono ${peCls}">${_esc(peTxt)}</td>
+    <td>${peOrigin}</td>
+    <td>${r.entrou_no_sla ? '<span style="color:#22A05B;font-weight:600">✓ entra</span>' : '<span style="color:#999">— excluída</span>'}</td>
+    <td>${_esc(r.categoria_sla)}</td>
+    <td style="max-width:280px;white-space:normal;font-size:11px;color:#666">${_esc(r.motivo)}${r.tipo_inconsistencia ? '<br><b style="color:#CC0000">⚠ ' + _esc(r.tipo_inconsistencia) + '</b>' : ''}</td>
+  </tr>`;
+}
+
+async function exportAuditCsv(){
+  const { qs } = _auGetFilters();
+  // export=csv força details=1 e devolve CSV — mesma rota do /diag/sla?mode=audit
+  const params = new URLSearchParams(qs);
+  params.set('export', 'csv');
+  params.delete('limit');
+  params.delete('offset');
+  const r = await fetch(API_BASE + '/diag/sla?mode=audit&' + params.toString(),
+                        { headers: _authHeaders() });
+  if (!r.ok){ alert('Erro ao gerar CSV: HTTP ' + r.status); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'auditoria_sla_' + new Date().toISOString().slice(0, 10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ── INICIALIZAÇÃO AUTOMÁTICA ──────────────────────────────────────────────────
