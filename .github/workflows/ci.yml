@@ -1,0 +1,70 @@
+name: CI
+
+# Quando rodar:
+#   - push em qualquer branch (main, dev/**, hotfix/**, ...)
+#   - PR cujo destino é main (portão antes do merge)
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# Reduz custo: se houver push novo no mesmo branch, cancela o anterior.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Mínimo de permissões: só leitura do conteúdo.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject.toml exige >=3.11. 3.11 é mínimo; 3.12 é o que rola em prod-like.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Show toolchain
+        run: |
+          python --version
+          pip --version
+          pytest --version
+          ruff --version
+
+      # Validação sintática: pega erros de sintaxe Python em qualquer arquivo
+      # antes mesmo de carregar ruff/pytest. Falha rápida e barata.
+      - name: Syntax check (compileall)
+        run: python -m compileall -q main.py tests/
+
+      # Lint: usa a config do pyproject.toml (incl. per-file-ignores tolerantes
+      # em main.py — refactor planejado fora desse escopo).
+      - name: Ruff lint
+        run: ruff check main.py tests/
+
+      # Suíte de testes da regra de negócio. -q para output compacto;
+      # falha o job se qualquer teste falhar.
+      - name: Pytest
+        run: pytest -q
