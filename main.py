@@ -72,6 +72,11 @@ DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Jadlog2026")[
 RATE_LIMIT_LOGIN_ATTEMPTS = int(os.environ.get("RATE_LIMIT_LOGIN_ATTEMPTS", "5"))
 RATE_LIMIT_LOGIN_WINDOW   = int(os.environ.get("RATE_LIMIT_LOGIN_WINDOW", "60"))
 
+# Snapshots temporais do SLA — persiste em JSONL diário.
+SNAPSHOT_ENABLED         = os.environ.get("SNAPSHOT_ENABLED", "1") == "1"
+SNAPSHOT_MIN_INTERVAL_S  = int(os.environ.get("SNAPSHOT_MIN_INTERVAL_S", "60"))
+SNAPSHOT_RETENTION_DAYS  = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "30"))
+
 BASE_DIR  = Path(__file__).parent
 DASHBOARD = BASE_DIR / "GestãoEntregas.html"
 
@@ -79,6 +84,7 @@ DASHBOARD = BASE_DIR / "GestãoEntregas.html"
 _DATA_ROOT = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
 FIN_DIR    = _DATA_ROOT / "dados" / "financeiro"
 OP_DIR     = _DATA_ROOT / "dados" / "operacional"
+SNAP_DIR   = _DATA_ROOT / "dados" / "snapshots"
 DB_PATH    = Path(os.environ.get("DB_PATH", str(_DATA_ROOT / "users.db")))
 
 # ── LOGGING ESTRUTURADO ────────────────────────────────────────────────────────
@@ -885,6 +891,16 @@ async def refresh_all():
     log.info(f"[perf][refresh] TOTAL refresh_all: {_refresh_elapsed/1000:.2f}s",
              extra={"event": "refresh_all_done", "duration_ms": _refresh_elapsed})
 
+    # Snapshot temporal do SLA. Roda fora do lock (já liberou acima); custo ~1-3s.
+    # Dedup interno via SNAPSHOT_MIN_INTERVAL_S evita arquivos inflados.
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, _take_sla_snapshot, _refresh_elapsed, False
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[snapshot] erro pós-refresh_all: {exc}",
+                  extra={"event": "snapshot_error", "erro": str(exc)[:200]})
+
 
 async def refresh_tipo(tipo: str):
     """Após upload: re-escaneia e recarrega apenas o tipo afetado (financeiro ou operacional)."""
@@ -1175,6 +1191,7 @@ async def startup():
     # Cria apenas as duas pastas necessárias
     FIN_DIR.mkdir(parents=True, exist_ok=True)
     OP_DIR.mkdir(parents=True, exist_ok=True)
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
     log.info(f"[startup] Pastas: {FIN_DIR} | {OP_DIR}")
 
     # Inicializa banco SQLite e carrega usuários persistidos
@@ -2215,6 +2232,189 @@ def _audit_badge(d: dict) -> str:
     if d.get("entrou_no_sla"):
         return "green"
     return "gray"
+
+
+# ── SNAPSHOTS TEMPORAIS DO SLA ──────────────────────────────────────────────
+# Persistência: JSONL diário em {DATA_ROOT}/dados/snapshots/sla-YYYY-MM-DD.jsonl
+# Cada linha = 1 snapshot ~600 bytes. Dedup por intervalo mínimo.
+# Retenção: arquivos com data > SNAPSHOT_RETENTION_DAYS são apagados.
+
+_last_snapshot_at: float = 0.0
+_snapshot_lock = _threading.Lock()
+
+
+def _snapshot_op_summary(op_filter: str | None) -> dict:
+    """Roda _diag_audit (sem detalhes) para uma operação ou global."""
+    payload = _diag_audit(op_filter=op_filter, codigos_filter=None,
+                           include_detalhes=False)
+    r = payload["resumo"]
+    a = payload["auditoria"]
+    return {
+        "total_sla": r["total_sla"],
+        "vencidas": r["vencidas"],
+        "vencem_hoje": r["vencem_hoje"],
+        "entregues_sla": r["entregues_sla"],
+        "custodia_sla": r["custodia_sla"],
+        "faltam": r["faltam"],
+        "sla_percentual": r["sla_percentual"],
+        "inconsistencias": a["inconsistencias"],
+        "remessas_suspeitas": a["remessas_suspeitas"],
+    }
+
+
+def _take_sla_snapshot(duration_refresh_ms: float | None = None,
+                       force: bool = False) -> dict | None:
+    """
+    Gera 1 snapshot do estado atual do SLA e grava em
+    {SNAP_DIR}/sla-YYYY-MM-DD.jsonl.
+    Retorna o snapshot salvo, ou None se foi pulado por dedup/disabled.
+    """
+    if not SNAPSHOT_ENABLED:
+        return None
+
+    global _last_snapshot_at
+    now = time.time()
+    with _snapshot_lock:
+        if not force and SNAPSHOT_MIN_INTERVAL_S > 0:
+            elapsed = now - _last_snapshot_at
+            if elapsed < SNAPSHOT_MIN_INTERVAL_S:
+                log.info(f"[snapshot] pulado (último há {elapsed:.0f}s, min={SNAPSHOT_MIN_INTERVAL_S}s)",
+                         extra={"event": "snapshot_skipped"})
+                return None
+
+        try:
+            cache_info = _cache_age_info()
+            snap = {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "version": APP_VERSION or "unknown",
+                "duration_refresh_ms": duration_refresh_ms,
+                "cache_age_s": cache_info.get("idade_cache_segundos"),
+                "global": _snapshot_op_summary(None),
+                "por_operacao": {
+                    k: _snapshot_op_summary(k) for k in OPS
+                },
+            }
+            SNAP_DIR.mkdir(parents=True, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = SNAP_DIR / f"sla-{today}.jsonl"
+            with path.open("a", encoding="utf-8") as fp:
+                fp.write(_json_logging.dumps(snap, ensure_ascii=False) + "\n")
+            _last_snapshot_at = now
+            log.info(f"[snapshot] salvo em {path.name} (SLA={snap['global']['sla_percentual']}%)",
+                     extra={"event": "snapshot_saved",
+                            "arquivo": path.name})
+            _cleanup_old_snapshots()
+            return snap
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[snapshot] falhou: {exc}",
+                      extra={"event": "snapshot_error", "erro": str(exc)[:200]})
+            return None
+
+
+def _cleanup_old_snapshots() -> int:
+    """Apaga arquivos sla-YYYY-MM-DD.jsonl com data > SNAPSHOT_RETENTION_DAYS.
+    Retorna a quantidade de arquivos apagados."""
+    if SNAPSHOT_RETENTION_DAYS <= 0 or not SNAP_DIR.exists():
+        return 0
+    cutoff = (datetime.now(timezone.utc) -
+              timedelta(days=SNAPSHOT_RETENTION_DAYS)).date()
+    removed = 0
+    for fp in SNAP_DIR.glob("sla-*.jsonl"):
+        try:
+            date_str = fp.stem.replace("sla-", "")
+            file_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                fp.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log.info(f"[snapshot] limpeza removeu {removed} arquivo(s) antigo(s)",
+                 extra={"event": "snapshot_cleanup", "linhas": removed})
+    return removed
+
+
+def _read_sla_history(date: str, op: str | None = None,
+                      interval_min: int = 0, limit: int = 1000) -> list[dict]:
+    """
+    Lê snapshots de um dia específico. Retorna lista de pontos
+    {ts, sla_percentual, total_sla, ...}.
+    `op`=None → global; `op`='gv'|... → por_operacao[op].
+    `interval_min`>0 → amostra um ponto a cada N minutos.
+    """
+    path = SNAP_DIR / f"sla-{date}.jsonl"
+    if not path.exists():
+        return []
+    points: list[dict] = []
+    last_bucket = None
+    interval_s = max(0, interval_min) * 60
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    snap = _json_logging.loads(line)
+                except (ValueError, OSError):
+                    continue
+                vals = snap.get("por_operacao", {}).get(op) if op else snap.get("global")
+                if not vals:
+                    continue
+                point = {"ts": snap.get("ts"), "cache_age_s": snap.get("cache_age_s"),
+                         "duration_refresh_ms": snap.get("duration_refresh_ms"),
+                         **vals}
+                # Amostragem por intervalo: pega apenas o primeiro de cada bucket
+                if interval_s > 0 and point.get("ts"):
+                    try:
+                        ts_dt = datetime.strptime(point["ts"], "%Y-%m-%dT%H:%M:%SZ")
+                        bucket_key = int(ts_dt.timestamp() // interval_s)
+                        if bucket_key == last_bucket:
+                            continue
+                        last_bucket = bucket_key
+                    except ValueError:
+                        pass
+                points.append(point)
+                if limit and len(points) >= limit:
+                    break
+    except OSError:
+        return []
+    return points
+
+
+@app.get("/health/sla/history")
+async def health_sla_history(
+    date: str | None = None,
+    op: str | None = None,
+    interval: int | None = None,
+    limit: int | None = 1000,
+    user: User = Depends(_get_current_user),
+):
+    """
+    Histórico de snapshots SLA.
+      date     YYYY-MM-DD (default: hoje UTC)
+      op       gv|itabira|jm|curvelo (default: global)
+      interval amostragem em minutos (default: sem amostragem)
+      limit    máximo de pontos (default: 1000)
+    """
+    if date is None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    op_key = op if (op and op in OPS) else None
+    iv = max(0, int(interval)) if interval else 0
+    lim = max(1, int(limit)) if limit else 1000
+    points = await asyncio.get_event_loop().run_in_executor(
+        None, _read_sla_history, date, op_key, iv, lim
+    )
+    return {
+        "date": date,
+        "op": op_key,
+        "interval_min": iv,
+        "count": len(points),
+        "points": points,
+    }
 
 
 @app.get("/status")
