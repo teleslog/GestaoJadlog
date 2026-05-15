@@ -47,13 +47,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import bcrypt as _bcrypt
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-import bcrypt as _bcrypt
 from pydantic import BaseModel
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
@@ -1423,7 +1423,8 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
 
 def _diag_audit_to_csv(payload: dict) -> str:
     """Serializa detalhes da auditoria em CSV (delimitador ;)."""
-    import io as _io, csv as _csv
+    import csv as _csv
+    import io as _io
     buf = _io.StringIO()
     w = _csv.writer(buf, delimiter=";", quoting=_csv.QUOTE_MINIMAL)
     w.writerow(["Codigo","Operacao","Status","DtEvento","Previsao","dDiff",

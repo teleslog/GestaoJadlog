@@ -17,3 +17,21 @@ server.err
 # OS
 .DS_Store
 Thumbs.db
+
+# Dev local
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+.claude/
+screenshots/
+tools/*.csv
+tools/*.json
+
+# Dados (não vão pro repo; produção usa o Volume do Railway)
+dados/operacional/*.xlsx
+dados/operacional/*.zip
+dados/financeiro/*.xlsx
+dados/financeiro/*.zip
+!dados/**/.gitkeep
