@@ -892,5 +892,92 @@ fetchAll(showLoading):
 
 ---
 
+## 12. Backup e Restore
+
+> Atalho operacional: `python tools/backup_data.py` gera um tarball
+> `.tar.gz` em `backups/` com tudo do `/data` + um manifest com sha256.
+
+### 12.1 O que entra no backup
+
+| Conteúdo | Origem (em produção) |
+|---|---|
+| `users.db` | `/data/users.db` (SQLite com usuários) |
+| `dados/operacional/*` | `/data/dados/operacional/*.xlsx,*.zip` |
+| `dados/financeiro/*` | `/data/dados/financeiro/*.xlsx,*.zip` |
+| `manifest.json` | gerado: `version`, `created_at`, lista de arquivos com `size` + `sha256` |
+
+Arquivos temporários do Excel (`~$*`) são ignorados.
+
+### 12.2 Como gerar backup local
+
+```
+python tools/backup_data.py                      # usa DATA_DIR ou raiz do projeto
+python tools/backup_data.py --data-dir /caminho  # origem custom
+python tools/backup_data.py --out /alvo/bkp.tar.gz
+```
+
+Saída padrão: `backups/backup-YYYYMMDD-HHMMSS.tar.gz`. A pasta `backups/`
+está no `.gitignore` — nunca vai para o repo.
+
+### 12.3 Como validar um backup (sem extrair)
+
+```
+python tools/restore_data.py <arquivo.tar.gz> --dry-run --data-dir /tmp/x
+```
+
+O `--dry-run`:
+1. Lê o manifest.
+2. Confere o sha256 de cada arquivo dentro do tarball.
+3. Imprime versão + total de arquivos + bytes.
+4. **Não escreve nada.**
+
+Se algum sha256 não bater, o script termina com erro.
+
+### 12.4 Como restaurar localmente
+
+```
+python tools/restore_data.py <arquivo.tar.gz> --data-dir /caminho/destino
+```
+
+Fluxo seguro:
+1. Lê manifest + valida sha256 de todos os arquivos.
+2. Pergunta `Confirma sobrescrever ...? [y/N]` (use `--yes` para pular).
+3. **Cria pré-backup automático** do estado atual do destino em
+   `backups/prebackup-YYYYMMDD-HHMMSS.tar.gz`.
+4. Extrai os arquivos do tarball mantendo a estrutura.
+
+Se algo der errado depois, o pré-backup permite reverter manualmente
+rodando o restore com ele como input.
+
+### 12.5 Cuidados em produção
+
+**Por default o restore RECUSA rodar em produção.** Ele detecta o ambiente
+pelas envs `RAILWAY_ENVIRONMENT`, `RENDER` ou `PRODUCTION` e aborta.
+
+Se for absolutamente necessário restaurar em produção:
+
+```
+RAILWAY_ENVIRONMENT=production \
+  python tools/restore_data.py <arquivo.tar.gz> \
+    --data-dir /data \
+    --allow-production
+```
+
+Antes de fazer isso:
+- Confirme com a equipe.
+- Tenha o backup ANTIGO em mãos (pré-backup é criado, mas redundância nunca é demais).
+- Faça em janela de baixa atividade.
+- Depois do restore, chame `POST /admin/rebuild-cache` para o `_cache` em
+  memória refletir os novos arquivos.
+
+### 12.6 Armazenamento externo (não automatizado ainda)
+
+Hoje os backups ficam apenas em `backups/` no host local. Para
+guardar histórico fora do servidor (S3, R2, Backblaze) basta `scp`/`rclone`
+para o destino após o `backup_data.py`. Automação via cron / Railway job
+não está incluída nesta etapa — fica para a próxima rodada (se decidirmos).
+
+---
+
 *Documento mantido por: André Teles / equipe de desenvolvimento*  
-*Última atualização: 2026-05-13 (rev3) — commits `ba23b20` → `48c8afd`*
+*Última atualização: 2026-05-15 — branch `dev/profissionalizacao-core` (P1-P7)*
