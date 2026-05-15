@@ -1139,7 +1139,7 @@ def _classify_sla_status(sla_pct: float, idade_segundos: int | None,
 def _health_sla_payload() -> dict:
     """Resumo SLA + idade do cache + status (ok/warning/critical).
     Reaproveita _diag_audit (sem detalhes) — mesma regra do painel."""
-    audit = _diag_audit(op_filter=None, codigos_filter=None)
+    audit = _diag_audit(op_filter=None, codigos_filter=None, include_detalhes=False)
     cache_info = _cache_age_info()
     status = _classify_sla_status(
         sla_pct=audit["resumo"]["sla_percentual"],
@@ -1479,16 +1479,42 @@ def _diag_build_dashrows(op_filter: str | None) -> tuple[dict[str, dict], dict[s
     return dash_by_code, op_of_code
 
 
-def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
+_VALID_CATEGORIAS = {"VENCIDAS", "VENCEM_HOJE", "ENTREGUES_SLA", "CUSTODIA_SLA", "FORA_SLA"}
+
+
+def _diag_audit(
+    op_filter: str | None,
+    codigos_filter: set[str] | None,
+    *,
+    include_detalhes: bool = False,
+    categoria_filter: str | None = None,
+    apenas_inconsistencias: bool = False,
+    apenas_excluidas_10h: bool = False,
+    limit: int = 0,
+    offset: int = 0,
+) -> dict:
     """
-    Auditoria completa do painel SLA + validação da regra das 10h.
-    Reproduz: parseOp + dedup + calcM + entraNoSlaHoje.
+    Auditoria do painel SLA + validação da regra das 10h.
+
+    Por padrão retorna só resumo + auditoria (response leve).
+    `include_detalhes=True` adiciona a lista `detalhes` (response grande).
+
+    Filtros aplicados na lista `detalhes` (não no resumo):
+      categoria_filter        — VENCIDAS / VENCEM_HOJE / ENTREGUES_SLA / CUSTODIA_SLA / FORA_SLA
+      apenas_inconsistencias  — só remessas que violam estritamente a regra 10h
+      apenas_excluidas_10h    — só remessas excluídas pela regra
+      limit / offset          — paginação
     """
+    _t0 = time.perf_counter()
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     dash_by_code, op_of_code = _diag_build_dashrows(op_filter)
+    _t1 = time.perf_counter()
 
     if codigos_filter:
         dash_by_code = {c: r for c, r in dash_by_code.items() if c in codigos_filter}
+
+    if categoria_filter and categoria_filter not in _VALID_CATEGORIAS:
+        categoria_filter = None  # ignora silenciosamente valor inválido
 
     counts = {"vencidas": 0, "vencem_hoje": 0, "entregues_sla": 0, "custodia_sla": 0,
               "excluidas_10h": 0, "fora_sla": 0}
@@ -1519,7 +1545,6 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             counts["fora_sla"] += 1
 
         # Validação ESTRITA: pacote no SLA cuja primeira entrada conhecida é hoje >=10h.
-        # PE_real hoje >=10h ou Status=ENTRADA atual hoje >=10h → viola a regra (bug).
         tipo_inc = None
         suspeita = None
         if buckets:
@@ -1530,15 +1555,11 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             de       = _parse_dt_evento(dt_str)
             de_day   = de.replace(hour=0, minute=0, second=0, microsecond=0) if de else None
 
-            # Estrita: PE real (não proxy) hoje >=10h, ou Status=ENTRADA hoje >=10h.
             if pe_d and not pe_proxy and pe_day == today and pe_d.hour >= 10:
                 tipo_inc = f"PE_real hoje {pe_d:%H:%M} >=10h no SLA"
             elif status == "ENTRADA" and de and de_day == today and de.hour >= 10:
                 tipo_inc = f"Status=ENTRADA hoje {de:%H:%M} >=10h no SLA"
 
-            # Suspeita (auditoria visual): no SLA com DtEvento hoje>=10h E PE proxy
-            # apontando antes de hoje. Pós-fix de Hist deve ser sempre legítimo
-            # (pacote estava na torre antes), mas listamos para conferência manual.
             if not tipo_inc and pe_proxy and pe_d and pe_day < today \
                     and de and de_day == today and de.hour >= 10:
                 suspeita = f"PE_proxy={pe_str[:10]} (estava na torre antes), DtEvento hoje {de:%H:%M}"
@@ -1553,6 +1574,20 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
                               "status": status, "dt_evento": dt_str,
                               "primeira_entrada": str(r.get("__primeira_entrada", "")),
                               "categoria_sla": ",".join(buckets)})
+
+        # detalhes só são montados se realmente vão ser usados (economia de memória).
+        if not include_detalhes:
+            continue
+
+        # Filtros sobre a lista `detalhes`:
+        if apenas_inconsistencias and not tipo_inc:
+            continue
+        if apenas_excluidas_10h and entra:
+            continue
+        if categoria_filter:
+            cat_atual = buckets[0] if buckets else "FORA_SLA"
+            if categoria_filter != cat_atual and categoria_filter not in buckets:
+                continue
 
         rota = (str(r.get("Rota", "")).strip()
                 or str(r.get("Hist. ultimo operador", "")).strip()
@@ -1569,19 +1604,43 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             "pe_proxy": bool(r.get("__pe_proxy", False)),
             "rota_entregador": rota,
             "entrou_no_sla": bool(buckets),
-            "categoria_sla": ",".join(buckets) if buckets else "—",
+            "categoria_sla": ",".join(buckets) if buckets else "FORA_SLA",
             "motivo": motivo,
             "inconsistente": bool(tipo_inc),
             "tipo_inconsistencia": tipo_inc,
         })
 
+    _t2 = time.perf_counter()
+    total_detalhes = len(detalhes)
+    # Paginação aplicada por último (sobre detalhes já filtrados).
+    if include_detalhes and (offset or limit):
+        end = (offset + limit) if limit > 0 else None
+        detalhes = detalhes[offset:end]
+
     den = counts["entregues_sla"] + counts["vencidas"] + counts["vencem_hoje"]
     sla_pct = round(counts["entregues_sla"] / den * 100, 2) if den else 100.0
+
+    cache_info = _cache_age_info()
+    elapsed = round(time.perf_counter() - _t0, 3)
+    log.info(
+        f"[diag/audit] op={op_filter} dash={len(dash_by_code)} "
+        f"build={_t1-_t0:.2f}s classify={_t2-_t1:.2f}s total={elapsed:.2f}s "
+        f"detalhes_filtrados={total_detalhes} retornados={len(detalhes)}"
+    )
 
     return {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "today": today.strftime("%Y-%m-%d"),
-        "filtros": {"operacao": op_filter, "codigos": sorted(codigos_filter) if codigos_filter else None},
+        "filtros": {
+            "operacao": op_filter,
+            "codigos": sorted(codigos_filter) if codigos_filter else None,
+            "categoria": categoria_filter,
+            "apenas_inconsistencias": apenas_inconsistencias,
+            "apenas_excluidas_10h": apenas_excluidas_10h,
+            "include_detalhes": include_detalhes,
+            "limit": limit,
+            "offset": offset,
+        },
         "resumo": {
             "dashboard_total": len(dash_by_code),
             "total_sla": counts["vencidas"] + counts["vencem_hoje"] + counts["entregues_sla"] + counts["custodia_sla"],
@@ -1598,8 +1657,12 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             "inconsistencias_detalhe": inconsistencias[:100],
             "remessas_suspeitas": len(suspeitas),
             "remessas_suspeitas_detalhe": suspeitas[:100],
+            "ultima_atualizacao_cache": cache_info.get("ultima_atualizacao"),
+            "idade_cache_segundos": cache_info.get("idade_cache_segundos"),
         },
+        "detalhes_total_filtrado": total_detalhes,
         "detalhes": detalhes,
+        "tempo_processamento_s": elapsed,
     }
 
 
@@ -1626,26 +1689,82 @@ async def diag_sla(
     mode: str | None = None,
     op: str | None = None,
     export: str | None = None,
+    details: int | None = None,
+    categoria: str | None = None,
+    apenas_inconsistencias: str | None = None,
+    apenas_excluidas_10h: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
     admin: User = Depends(_require_gestor),
 ):
     """
     Diagnóstico SLA.
 
     Modos:
-      mode=audit         → auditoria completa do painel + inconsistências da regra 10h
+      mode=audit         → auditoria do painel + inconsistências da regra 10h
       (sem mode)         → legado: diagnóstico por código (codigos=A,B,C obrigatório)
 
     Filtros (modo audit):
       op=gv|itabira|jm|curvelo   → restringe a uma operação
       codigos=A,B,C              → restringe a códigos específicos
-      export=csv                 → retorna CSV em vez de JSON
+      details=1                  → inclui lista 'detalhes' (response grande)
+      categoria=VENCIDAS|VENCEM_HOJE|ENTREGUES_SLA|CUSTODIA_SLA|FORA_SLA
+      apenas_inconsistencias=true → só remessas que violam estritamente a regra
+      apenas_excluidas_10h=true   → só remessas excluídas pela regra 10h
+      limit=100                  → trunca detalhes
+      offset=0                   → paginação
+      export=csv                 → força details=1 e retorna CSV
     """
     if mode == "audit":
         cset = {c.strip() for c in codigos.split(",") if c.strip()} if codigos else None
         op_key = op if (op and op in OPS) else None
+        want_csv = (export == "csv")
+        want_det = bool(details) or want_csv
+        det_limit = max(int(limit), 0) if limit else 0
+        det_offset = max(int(offset), 0) if offset else 0
+        cat_filter = categoria.upper().strip() if categoria else None
+        only_inc = str(apenas_inconsistencias or "").lower() in ("1", "true", "yes", "sim")
+        only_excl = str(apenas_excluidas_10h or "").lower() in ("1", "true", "yes", "sim")
+
+        # Snapshot rápido do cache sob lock; processamento pesado fora do lock
+        # e em thread executor — não bloqueia o event loop.
         async with _cache_lock:
-            payload = _diag_audit(op_filter=op_key, codigos_filter=cset)
-        if export == "csv":
+            cache_snap = {
+                "operacional": {
+                    k: {
+                        "dados": list((_cache.get("operacional", {}).get(k) or {}).get("dados") or []),
+                        "atualizado": (_cache.get("operacional", {}).get(k) or {}).get("atualizado"),
+                        "linhas": (_cache.get("operacional", {}).get(k) or {}).get("linhas", 0),
+                        "arquivo": (_cache.get("operacional", {}).get(k) or {}).get("arquivo"),
+                        "erro": (_cache.get("operacional", {}).get(k) or {}).get("erro"),
+                    }
+                    for k in OPS
+                },
+                "financeiro": {},
+            }
+
+        def _run():
+            global _cache
+            saved = _cache
+            try:
+                _cache = cache_snap
+                return _diag_audit(
+                    op_filter=op_key,
+                    codigos_filter=cset,
+                    include_detalhes=want_det,
+                    categoria_filter=cat_filter,
+                    apenas_inconsistencias=only_inc,
+                    apenas_excluidas_10h=only_excl,
+                    limit=det_limit,
+                    offset=det_offset,
+                )
+            finally:
+                _cache = saved
+
+        loop = asyncio.get_event_loop()
+        payload = await loop.run_in_executor(None, _run)
+
+        if want_csv:
             from fastapi.responses import PlainTextResponse
             csv_text = _diag_audit_to_csv(payload)
             fname = f"diag_sla_audit_{payload['today']}.csv"
