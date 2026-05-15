@@ -37,10 +37,12 @@ import io
 import json as _json_logging
 import logging
 import os
+import random as _random
 import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading as _threading
 import time
 import uuid
 import zipfile
@@ -51,7 +53,7 @@ from typing import Optional
 
 import bcrypt as _bcrypt
 import pandas as pd
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -65,6 +67,10 @@ JWT_SECRET             = os.environ.get("JWT_SECRET", "mude-em-producao-use-open
 JWT_ALGORITHM          = "HS256"
 JWT_EXPIRE_HOURS       = 12
 DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Jadlog2026")[:72]
+
+# Rate-limit do /auth/login. Configurar via env. Definir qualquer um como 0 desliga.
+RATE_LIMIT_LOGIN_ATTEMPTS = int(os.environ.get("RATE_LIMIT_LOGIN_ATTEMPTS", "5"))
+RATE_LIMIT_LOGIN_WINDOW   = int(os.environ.get("RATE_LIMIT_LOGIN_WINDOW", "60"))
 
 BASE_DIR  = Path(__file__).parent
 DASHBOARD = BASE_DIR / "GestãoEntregas.html"
@@ -90,6 +96,7 @@ LOG_JSON = os.environ.get("LOG_JSON", "0") == "1"
 _EXTRA_LOG_FIELDS = {
     "event", "method", "route", "status_code", "duration_ms",
     "operacao", "codigo", "arquivo", "linhas", "key", "tipo", "erro",
+    "ip", "retry_after_s",
 }
 
 
@@ -289,6 +296,52 @@ def _load_users_db() -> list[User]:
         )
         for r in rows
     ]
+
+
+# ── RATE LIMIT — /auth/login ────────────────────────────────────────────────
+# Estrutura simples em memória: dict[ip, list[timestamp]]. Janela deslizante.
+# Protegido por threading.Lock (GIL-friendly, sem custo perceptível).
+# Sem dependência externa. Para multi-instance, trocar por Redis no futuro.
+
+_login_attempts: dict[str, list[float]] = {}
+_login_attempts_lock = _threading.Lock()
+
+
+def _client_ip(request) -> str:
+    """Extrai IP real considerando proxy reverso (Railway / Render setam X-Forwarded-For)."""
+    fwd = (request.headers.get("x-forwarded-for") or "").strip()
+    if fwd:
+        # Pode ser CSV de IPs (proxy chain); o primeiro é o cliente original.
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_rate_check(ip: str) -> tuple[bool, int]:
+    """
+    Retorna (allowed, retry_after_seconds).
+    allowed=False quando IP atingiu RATE_LIMIT_LOGIN_ATTEMPTS na janela atual.
+    Definir RATE_LIMIT_LOGIN_ATTEMPTS=0 ou WINDOW=0 desliga o rate-limit.
+    """
+    if RATE_LIMIT_LOGIN_ATTEMPTS <= 0 or RATE_LIMIT_LOGIN_WINDOW <= 0:
+        return True, 0
+    now = time.time()
+    window_start = now - RATE_LIMIT_LOGIN_WINDOW
+    with _login_attempts_lock:
+        attempts = [t for t in _login_attempts.get(ip, []) if t > window_start]
+        if len(attempts) >= RATE_LIMIT_LOGIN_ATTEMPTS:
+            oldest = attempts[0]
+            retry_after = max(1, int(oldest + RATE_LIMIT_LOGIN_WINDOW - now) + 1)
+            _login_attempts[ip] = attempts
+            return False, retry_after
+        attempts.append(now)
+        _login_attempts[ip] = attempts
+        return True, 0
+
+
+def _login_rate_clear(ip: str) -> None:
+    """Limpa contagem após login bem-sucedido (não pune usuário legítimo)."""
+    with _login_attempts_lock:
+        _login_attempts.pop(ip, None)
 
 
 def _hash(plain: str) -> str:
@@ -1352,18 +1405,47 @@ async def root():
 # ── AUTH ───────────────────────────────────────────────────────────────────────
 
 @app.post("/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    ip = _client_ip(request)
+    # 1) Rate-limit primeiro: bloqueia antes mesmo de tocar no SQLite/bcrypt.
+    allowed, retry_after = _login_rate_check(ip)
+    if not allowed:
+        log.warning(
+            f"[auth] rate-limit bloqueou IP {ip} (login tentado: '{req.login}')",
+            extra={"event": "login_rate_limited", "operacao": req.login,
+                   "ip": ip, "retry_after_s": retry_after},
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limited",
+                "message": f"Muitas tentativas de login. Tente novamente em {retry_after} segundos.",
+                "retry_after_s": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # 2) Verifica credenciais
     async with users_lock:
         user = next((u for u in users_db.values() if u.login.lower() == req.login.lower()), None)
     if not user or not _verify(req.password.strip(), user.password_hash):
-        # Não loga a senha; só o login que tentou.
-        log.warning(f"[auth] login falhou para '{req.login}'",
-                    extra={"event": "login_failed", "operacao": req.login})
+        # Atraso pequeno e aleatório dificulta brute-force (timing attacks
+        # e enumeração de usuários valid os).
+        await asyncio.sleep(0.3 + _random.random() * 0.2)
+        log.warning(
+            f"[auth] login falhou para '{req.login}' (IP {ip})",
+            extra={"event": "login_failed", "operacao": req.login, "ip": ip},
+        )
         raise HTTPException(401, "Login ou senha inválidos")
+
+    # 3) Sucesso: limpa o contador desse IP, popula contextvars, loga e devolve token.
+    _login_rate_clear(ip)
     _user_login_ctx.set(user.login)
     _user_role_ctx.set(user.role)
-    log.info(f"[auth] login ok ({user.role})",
-             extra={"event": "login_success"})
+    log.info(
+        f"[auth] login ok ({user.role}) IP {ip}",
+        extra={"event": "login_success", "ip": ip},
+    )
     return {
         "access_token":        _create_token(user),
         "token_type":          "bearer",
