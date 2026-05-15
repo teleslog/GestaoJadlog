@@ -1016,13 +1016,195 @@ async def startup():
     log.info("[startup] Concluído")
     asyncio.create_task(_background_refresh())
 
-# ── ROTAS PÚBLICAS ─────────────────────────────────────────────────────────────
-
 _NO_CACHE = {
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma":        "no-cache",
     "Expires":       "0",
 }
+
+# ── HEALTH ENDPOINTS ───────────────────────────────────────────────────────────
+# Princípios:
+#   - /healthz e /readyz são públicos (probes não autenticam).
+#   - Nenhum endpoint dispara refresh_all (read-only sobre o cache).
+#   - /health/sla é autenticado (números operacionais).
+#   - Funções helper retornam dicts puros: facilita testes sem subir servidor.
+
+
+def _healthz_payload() -> dict:
+    """Liveness: processo está vivo e respondendo. Mínimo possível."""
+    return {
+        "status": "ok",
+        "version": APP_VERSION or "unknown",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _readyz_payload() -> tuple[dict, bool]:
+    """Readiness: pronto para servir tráfego. Retorna (payload, ok).
+    ok=False → caller deve responder 503.
+    """
+    checks: dict[str, object] = {}
+
+    # 1) Startup completou? (refresh_all gravou _cache populado)
+    cache_loaded = any(
+        (_cache.get("operacional", {}).get(k) or {}).get("dados")
+        for k in OPS
+    )
+    checks["startup_completo"] = bool(APP_VERSION)
+    checks["cache_loaded"] = cache_loaded
+
+    # 2) Quais ops têm dados de fato carregados
+    ops_com_dados = [
+        k for k in OPS
+        if ((_cache.get("operacional", {}).get(k) or {}).get("linhas") or 0) > 0
+    ]
+    checks["operacoes_com_dados"] = ops_com_dados
+
+    # 3) users.db acessível? Query trivial.
+    try:
+        with _db() as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks["users_db_acessivel"] = True
+    except Exception as exc:  # noqa: BLE001
+        checks["users_db_acessivel"] = False
+        checks["users_db_erro"] = str(exc)[:200]
+
+    # 4) /data acessível?
+    checks["data_dir"] = str(_DATA_ROOT)
+    checks["data_dir_acessivel"] = _DATA_ROOT.exists() and OP_DIR.exists()
+
+    ok = (
+        checks["startup_completo"]
+        and checks["cache_loaded"]
+        and checks["users_db_acessivel"]
+        and checks["data_dir_acessivel"]
+    )
+
+    return {
+        "status": "ok" if ok else "not_ready",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "checks": checks,
+    }, ok
+
+
+def _cache_age_info() -> dict:
+    """Mais recente `atualizado` entre as ops operacionais + idade em segundos."""
+    latest: datetime | None = None
+    ops_info = []
+    for key in OPS:
+        e = _cache.get("operacional", {}).get(key) or {}
+        atualizado = e.get("atualizado")
+        ops_info.append({
+            "key": key,
+            "linhas": e.get("linhas", 0),
+            "arquivo": e.get("arquivo"),
+            "atualizado": atualizado,
+            "erro": e.get("erro"),
+        })
+        if atualizado:
+            try:
+                dt = datetime.strptime(atualizado, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if latest is None or dt > latest:
+                    latest = dt
+            except ValueError:
+                pass
+    if latest is None:
+        return {"ultima_atualizacao": None, "idade_cache_segundos": None, "operacoes": ops_info}
+    age = int((datetime.now(timezone.utc) - latest).total_seconds())
+    return {
+        "ultima_atualizacao": latest.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "idade_cache_segundos": age,
+        "operacoes": ops_info,
+    }
+
+
+def _classify_sla_status(sla_pct: float, idade_segundos: int | None,
+                         inconsistencias: int, total_sla: int) -> str:
+    """Regras de severidade do /health/sla."""
+    if total_sla == 0:
+        return "critical"  # sem dados = não consegue auditar
+    if inconsistencias > 0:
+        return "critical"
+    if idade_segundos is not None and idade_segundos > 3600:
+        return "critical"
+    if sla_pct < 85:
+        return "critical"
+    if idade_segundos is not None and idade_segundos > 1800:
+        return "warning"
+    if sla_pct < 95:
+        return "warning"
+    return "ok"
+
+
+def _health_sla_payload() -> dict:
+    """Resumo SLA + idade do cache + status (ok/warning/critical).
+    Reaproveita _diag_audit (sem detalhes) — mesma regra do painel."""
+    audit = _diag_audit(op_filter=None, codigos_filter=None)
+    cache_info = _cache_age_info()
+    status = _classify_sla_status(
+        sla_pct=audit["resumo"]["sla_percentual"],
+        idade_segundos=cache_info["idade_cache_segundos"],
+        inconsistencias=audit["auditoria"]["inconsistencias"],
+        total_sla=audit["resumo"]["total_sla"],
+    )
+    return {
+        "status": status,
+        "version": APP_VERSION or "unknown",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sla": {
+            **audit["resumo"],
+            "inconsistencias": audit["auditoria"]["inconsistencias"],
+        },
+        "cache": cache_info,
+    }
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe — sem auth."""
+    return _healthz_payload()
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe — sem auth. Retorna 503 se não pronto."""
+    payload, ok = _readyz_payload()
+    if not ok:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+@app.get("/health/sla")
+async def health_sla(admin: User = Depends(_require_gestor)):
+    """Saúde operacional do SLA (resumo + cache age + status)."""
+    loop = asyncio.get_event_loop()
+    async with _cache_lock:
+        # Acessa _cache dentro do lock; computação fora.
+        cache_snap = {
+            "operacional": {
+                k: {"dados": list((_cache.get("operacional", {}).get(k) or {}).get("dados") or []),
+                    "linhas": (_cache.get("operacional", {}).get(k) or {}).get("linhas", 0),
+                    "arquivo": (_cache.get("operacional", {}).get(k) or {}).get("arquivo"),
+                    "atualizado": (_cache.get("operacional", {}).get(k) or {}).get("atualizado"),
+                    "erro": (_cache.get("operacional", {}).get(k) or {}).get("erro")}
+                for k in OPS
+            },
+            "financeiro": {},
+        }
+
+    def _run():
+        global _cache
+        saved = _cache
+        try:
+            _cache = cache_snap
+            return _health_sla_payload()
+        finally:
+            _cache = saved
+
+    return await loop.run_in_executor(None, _run)
+
+
+# ── ROTAS PÚBLICAS ─────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
