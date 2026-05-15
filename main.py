@@ -32,7 +32,9 @@ Endpoints ADMIN:
 """
 
 import asyncio
+import contextvars
 import io
+import json as _json_logging
 import logging
 import os
 import shutil
@@ -73,7 +75,82 @@ FIN_DIR    = _DATA_ROOT / "dados" / "financeiro"
 OP_DIR     = _DATA_ROOT / "dados" / "operacional"
 DB_PATH    = Path(os.environ.get("DB_PATH", str(_DATA_ROOT / "users.db")))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+# ── LOGGING ESTRUTURADO ────────────────────────────────────────────────────────
+# Cada request tem um request_id (gerado se não vier no header). Filter injeta
+# request_id + user nos LogRecords automaticamente — sem precisar mexer em
+# cada log.info() existente. Formato controlado por env LOG_JSON.
+
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+_user_login_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("user_login", default="-")
+_user_role_ctx:  contextvars.ContextVar[str] = contextvars.ContextVar("user_role",  default="-")
+
+LOG_JSON = os.environ.get("LOG_JSON", "0") == "1"
+
+# Campos que viram chaves de primeiro nível no JSON quando passados via extra={}.
+_EXTRA_LOG_FIELDS = {
+    "event", "method", "route", "status_code", "duration_ms",
+    "operacao", "codigo", "arquivo", "linhas", "key", "tipo", "erro",
+}
+
+
+class _ContextFilter(logging.Filter):
+    """Injeta request_id + user em todo LogRecord."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_ctx.get()
+        record.user_login = _user_login_ctx.get()
+        record.user_role  = _user_role_ctx.get()
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    """Formato estruturado para logs (1 linha = 1 JSON)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "request_id": getattr(record, "request_id", "-"),
+            "user": getattr(record, "user_login", "-"),
+            "role": getattr(record, "user_role", "-"),
+        }
+        for k in _EXTRA_LOG_FIELDS:
+            v = getattr(record, k, None)
+            if v is not None:
+                payload[k] = v
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return _json_logging.dumps(payload, ensure_ascii=False, default=str)
+
+
+class _TextFormatter(logging.Formatter):
+    """Formato human-friendly mantendo request_id + user visíveis."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rid = getattr(record, "request_id", "-")
+        user = getattr(record, "user_login", "-")
+        msg = record.getMessage()
+        if record.exc_info:
+            msg = f"{msg}\n{self.formatException(record.exc_info)}"
+        return f"{ts} {record.levelname:5s} req={rid} user={user}  {msg}"
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JsonFormatter() if LOG_JSON else _TextFormatter())
+    handler.addFilter(_ContextFilter())
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_setup_logging()
 log = logging.getLogger("api")
 
 # ── VERSÃO ─────────────────────────────────────────────────────────────────────
@@ -248,6 +325,9 @@ async def _get_current_user(
         raise HTTPException(401, "Usuário não encontrado")
     if not user.ativo:
         raise HTTPException(401, "Usuário desativado. Contate o administrador.")
+    # Popula contextvars para os logs subsequentes desta request.
+    _user_login_ctx.set(user.login)
+    _user_role_ctx.set(user.role)
     return user
 
 
@@ -748,7 +828,9 @@ async def refresh_all():
     for tmp in filter(None, [fin_tmp, op_tmp]):
         shutil.rmtree(tmp, ignore_errors=True)
 
-    log.info(f"[perf][refresh] TOTAL refresh_all: {time.perf_counter()-_t_total:.2f}s")
+    _refresh_elapsed = round((time.perf_counter() - _t_total) * 1000, 1)
+    log.info(f"[perf][refresh] TOTAL refresh_all: {_refresh_elapsed/1000:.2f}s",
+             extra={"event": "refresh_all_done", "duration_ms": _refresh_elapsed})
 
 
 async def refresh_tipo(tipo: str):
@@ -953,7 +1035,10 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
     log.info(f"[perf] merge_incremental  {tipo}/{key} "
              f"(novas={rows_novas}, atualizadas={rows_atualizadas}, total_cache={rows_total}): "
              f"{time.perf_counter()-_t:.2f}s")
-    log.info(f"[perf] merge_incremental TOTAL  {tipo}/{key}: {time.perf_counter()-_t_total:.2f}s")
+    _merge_elapsed = round((time.perf_counter() - _t_total) * 1000, 1)
+    log.info(f"[perf] merge_incremental TOTAL  {tipo}/{key}: {_merge_elapsed/1000:.2f}s",
+             extra={"event": "merge_incremental_done", "tipo": tipo, "key": key,
+                    "duration_ms": _merge_elapsed})
 
 
 async def _background_refresh():
@@ -971,6 +1056,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Rotas onde NÃO logamos a chamada (evita poluição em healthchecks).
+_HTTP_LOG_SKIP = {"/healthz", "/readyz"}
+
+
+@app.middleware("http")
+async def request_context_middleware(request, call_next):
+    """
+    Para cada requisição:
+      - lê X-Request-ID (ou gera um novo)
+      - registra contextvars (request_id + user vazios)
+      - mede tempo de resposta
+      - loga 1 linha estruturada com {método, rota, status, duração}
+      - devolve X-Request-ID na response
+    Não toca em body — não há risco de logar dados sensíveis.
+    """
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    token_rid = _request_id_ctx.set(rid)
+    token_user = _user_login_ctx.set("-")
+    token_role = _user_role_ctx.set("-")
+    _t0 = time.perf_counter()
+    response = None
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed = round((time.perf_counter() - _t0) * 1000, 1)
+        path = request.url.path
+        if path not in _HTTP_LOG_SKIP:
+            log.info(
+                f"{request.method} {path} {status_code} ({elapsed}ms)",
+                extra={
+                    "event": "http_request",
+                    "method": request.method,
+                    "route": path,
+                    "status_code": status_code,
+                    "duration_ms": elapsed,
+                },
+            )
+        if response is not None:
+            response.headers["X-Request-ID"] = rid
+        _request_id_ctx.reset(token_rid)
+        _user_login_ctx.reset(token_user)
+        _user_role_ctx.reset(token_role)
 
 
 @app.on_event("startup")
@@ -1224,7 +1356,14 @@ async def login(req: LoginRequest):
     async with users_lock:
         user = next((u for u in users_db.values() if u.login.lower() == req.login.lower()), None)
     if not user or not _verify(req.password.strip(), user.password_hash):
+        # Não loga a senha; só o login que tentou.
+        log.warning(f"[auth] login falhou para '{req.login}'",
+                    extra={"event": "login_failed", "operacao": req.login})
         raise HTTPException(401, "Login ou senha inválidos")
+    _user_login_ctx.set(user.login)
+    _user_role_ctx.set(user.role)
+    log.info(f"[auth] login ok ({user.role})",
+             extra={"event": "login_success"})
     return {
         "access_token":        _create_token(user),
         "token_type":          "bearer",
@@ -1807,7 +1946,8 @@ async def diag_sla(
 
 async def _do_rebuild_cache(admin_login: str) -> dict:
     """Rebuild completo do _cache lendo tudo do disco. Bloqueia uploads concorrentes."""
-    log.info(f"[admin] {admin_login} → rebuild-cache iniciado")
+    log.info(f"[admin] {admin_login} → rebuild-cache iniciado",
+             extra={"event": "rebuild_cache_started"})
     _t = time.perf_counter()
     await refresh_all()
     elapsed = time.perf_counter() - _t
@@ -1822,7 +1962,8 @@ async def _do_rebuild_cache(admin_login: str) -> dict:
                     "linhas": e.get("linhas", 0),
                     "atualizado": e.get("atualizado"), "erro": e.get("erro"),
                 })
-    log.info(f"[admin] rebuild-cache concluído em {elapsed:.2f}s")
+    log.info(f"[admin] rebuild-cache concluído em {elapsed:.2f}s",
+             extra={"event": "rebuild_cache_done", "duration_ms": round(elapsed*1000, 1)})
     return {
         "ok": True,
         "elapsed_seconds": round(elapsed, 2),
@@ -1910,7 +2051,9 @@ async def upload_file(
     _t = time.perf_counter()
     dest.write_bytes(content)
     log.info(f"[perf] save_to_disk  {file.filename} ({len(content)//1024} KB | tipo={tipo}): {time.perf_counter()-_t:.3f}s")
-    log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)")
+    log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)",
+             extra={"event": "upload_started", "tipo": tipo,
+                    "arquivo": file.filename, "linhas": None})
 
     # Detecta a key do arquivo recém-salvo e atualiza só esse cache
     loop = asyncio.get_event_loop()
@@ -1924,7 +2067,11 @@ async def upload_file(
         log.warning(f"[upload] {file.filename}: key não detectada, fallback refresh_tipo completo")
         await refresh_tipo(tipo)
     log.info(f"[perf] refresh_all_TOTAL  tipo={tipo}: {time.perf_counter()-_t:.2f}s")
-    log.info(f"[perf] TOTAL_UPLOAD  {file.filename}: {time.perf_counter()-_t_upload:.2f}s")
+    _upload_elapsed = round((time.perf_counter() - _t_upload) * 1000, 1)
+    log.info(f"[perf] TOTAL_UPLOAD  {file.filename}: {_upload_elapsed/1000:.2f}s",
+             extra={"event": "upload_done", "tipo": tipo,
+                    "arquivo": file.filename, "duration_ms": _upload_elapsed,
+                    "key": detected_key})
 
     # Retorna quais operações foram identificadas na pasta
     async with _cache_lock:
