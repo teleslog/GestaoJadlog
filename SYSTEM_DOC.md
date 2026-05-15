@@ -2,9 +2,11 @@
 
 > **Fonte da verdade do sistema.** Este documento descreve a arquitetura, regras de negócio, lógica crítica e convenções do GestãoEntregas. Deve ser atualizado a cada mudança estrutural relevante.
 
-**Versão do documento:** 2026-05-13 (rev3)  
-**Repositório:** https://github.com/teleslog/GestaoJadlog.git (branch `main`)  
-**Deploy:** https://web-production-1614e.up.railway.app  
+**Versão do documento:** 2026-05-15 (rev4)  
+**Repositório:** https://github.com/teleslog/GestaoJadlog.git  
+&nbsp;&nbsp;&nbsp;&nbsp;branch `main` — produção  
+&nbsp;&nbsp;&nbsp;&nbsp;branch `dev/profissionalizacao-core` — base técnica (testes, CI, health, logs, backup)  
+**Deploy produção:** https://web-production-1614e.up.railway.app  
 **Diretório local:** `C:\Users\André\Downloads\cloud_api\`
 
 ---
@@ -22,6 +24,12 @@
 9. [Fluxos Críticos](#9-fluxos-críticos)
 10. [Troubleshooting](#10-troubleshooting)
 11. [Roadmap](#11-roadmap)
+12. [Backup e Restore](#12-backup-e-restore)
+13. [Endpoints de Saúde e Diagnóstico](#13-endpoints-de-saúde-e-diagnóstico)
+14. [Testes e CI](#14-testes-e-ci)
+15. [Observabilidade (logs estruturados e request_id)](#15-observabilidade-logs-estruturados-e-request_id)
+16. [Runbook Operacional](#16-runbook-operacional)
+17. [Fluxo Dev → Produção](#17-fluxo-dev--produção)
 
 ---
 
@@ -246,50 +254,74 @@ Remessas que chegam à torre após as 10h não têm tempo hábil para entrega no
 
 > Uma remessa é **excluída do SLA do dia** se a sua **primeira entrada operacional** na torre ocorreu **hoje** em horário **≥ 10:00**.
 
-#### Campo `__primeira_entrada` (backend)
+#### Campo `__primeira_entrada` (backend) — invariantes pós-879a787
 
-O backend extrai, para cada `Codigo`, o menor `Dt Evento` onde `Status = 'ENTRADA'` — **antes da deduplicação**. Isso é necessário porque o arquivo xlsx é um log de eventos; após dedup, o registro de ENTRADA pode ter sido sobrescrito por um evento posterior (ex.: EM ROTA).
+**IMPORTANTE:** o `Performance.xlsx` é um **SNAPSHOT** (1 linha por Código com o
+estado atual), não um log de eventos. A PE precisa ser tracked ao longo de
+múltiplos uploads — o backend mantém isso no cache em memória.
 
 ```python
-def _compute_primeira_entrada(rows: list[dict]) -> dict[str, str]:
-    # Para cada Codigo, encontra o menor DtEvento com Status=ENTRADA
-    # Retorna dict {Codigo: "DD/MM/YYYY HH:MM:SS"}
+def _compute_primeira_entrada(rows, op_name=None):
+    """
+    PE real = MIN(Dt Evento) entre linhas onde:
+       Status == 'ENTRADA' AND Hist. ultimo ponto == op_name
+    """
 ```
 
-O resultado é injetado como campo `__primeira_entrada` em cada linha antes de servir ao frontend.
+Invariantes (cobertas por `tests/test_pe_compute.py` e `test_regressions.py`):
 
-#### Proxy PE para remessas sem evento ENTRADA
+1. **PE = MIN absoluto** (jamais MAX, jamais "ENTRADA mais recente de hoje").
+   Pacote com ENTRADA registrada ontem 09:00 e re-scan hoje 14:36 mantém PE=ontem 09:00.
+2. **Filtro `Hist=nossa op` é obrigatório.** Linhas com `Hist. ultimo ponto`
+   diferente da operação atual (pacote em trânsito por outra torre) NÃO
+   contam para PE. Antes de `879a787` esse filtro não existia e PE proxy
+   herdava `Dt Evento` de outra torre, causando inclusão indevida no SLA.
+3. **PE nunca é apagada por update.** `merge_incremental` preserva `pe_old`
+   ao substituir uma linha existente.
+4. **PE real sempre vence PE proxy.** Quando uma ENTRADA real aparece num
+   upload posterior, ela substitui o proxy.
+5. **Entre 2 PE reais, vence a MENOR.**
 
-Remessas que nunca aparecem com `Status=ENTRADA` em nenhum snapshot (ex.: chegam diretamente como EM ROTA) jamais teriam `__primeira_entrada` definida por `_compute_primeira_entrada`. Sem PE, o fallback `if(!pe)return true` em `entraNoSlaHoje` as incluía incorretamente no SLA.
+#### Proxy PE para remessas sem evento ENTRADA na nossa torre
 
-**Solução (2026-05-13):** ambos os caminhos de carga aplicam proxy:
+Quando um código nunca aparece com `Status=ENTRADA` em snapshot algum
+(chega já como `EM ROTA`, `CUSTODIA`, etc.):
 
-- **`merge_incremental`** (upload): para **novos códigos** (primeira aparição no cache) sem PE após `nova_pe`, usa o `Dt Evento` do novo arquivo como proxy.
-- **`_read_and_merge`** (startup / `refresh_all`): após injetar `pe_map`, calcula o **menor `Dt Evento` histórico** por código (de todos os arquivos) e usa como proxy para os que ainda estão sem PE.
-
-Essa cobertura dupla garante que um código chegado hoje após 10h — independente de como entrou no cache — tenha `__primeira_entrada` preenchida e seja corretamente excluído do SLA.
+- **`_read_and_merge`** (startup / `refresh_all`): proxy = MIN(`Dt Evento`)
+  entre linhas com `Hist=nossa op` em qualquer arquivo. Linhas com
+  `Hist=outra torre` são descartadas.
+- **`merge_incremental`** (upload): mesma regra aplicada ao novo arquivo;
+  códigos novos OU existentes sem PE recebem o proxy.
+- Flag `__pe_proxy=True` marca esses casos. Um real ENTRADA futuro substitui.
 
 #### Campo `PrimeiraEntrada` (frontend)
 
-Mapeado de `r['__primeira_entrada']` em `parseOp()`. O campo é protegido em `mergeOp()` para não ser sobrescrito por uma atualização que não contenha o evento de ENTRADA.
+Mapeado de `r['__primeira_entrada']` em `parseOp()`. **O backend é a fonte
+de verdade** — `mergeOp()` confia no valor recebido e só protege contra
+ser sobrescrito por vazio (proteção mínima). Não há lógica de MIN no
+frontend (commit `4403b6b` removeu o enforce MIN que causava cascateamento
+do valor antigo errado).
 
 #### Função centralizada `entraNoSlaHoje(row)`
 
 ```javascript
 function entraNoSlaHoje(row) {
-  // Retorna true  → incluir no SLA de hoje
-  // Retorna false → excluir (entrada hoje após 10h)
-
-  const pe = row.PrimeiraEntrada;
-  // Sem data: inclui por precaução
-  // Entrada antes de hoje: inclui (remessa antiga)
-  // Entrada depois de hoje: inclui (caso improvável — inclui por precaução)
-  // Entrada hoje antes das 10h: inclui
-  // Entrada hoje às 10h ou depois: EXCLUI
+  // Candidatos para "primeira entrada":
+  //   1. PrimeiraEntrada (PE) recebida do backend
+  //   2. Para Status=ENTRADA atual, DtEvento também é candidato (safety net)
+  // Vence o MIN entre os candidatos.
+  //
+  // Resultado:
+  //   sem candidato       → true (inclui por precaução)
+  //   MIN < hoje          → true (histórico)
+  //   MIN hoje < 10h      → true
+  //   MIN hoje >= 10h     → false (EXCLUI)
+  //   MIN > hoje (futuro) → true (anomalia, conservador)
 }
 ```
 
-**Esta é a ÚNICA função que implementa a regra das 10h. Nunca duplicar esta lógica.**
+**Esta é a ÚNICA função que implementa a regra das 10h no frontend.
+Não duplicar esta lógica. Coberta por 10 testes em `tests/test_entra_no_sla.py`.**
 
 #### Exemplos
 
@@ -303,14 +335,18 @@ function entraNoSlaHoje(row) {
 
 #### Pontos de aplicação
 
-A regra se aplica a todos os componentes do SLA do dia:
-- `vencHoje` (vencem hoje)
+A regra se aplica a **todos** os componentes do SLA do dia, incluindo vencidas:
+- `vencidas` (prazo passado, pendentes) — desde `cfb73d3`
+- `vencHoje` (vencem hoje, pendentes)
 - `slaEntregue` (entregues no prazo)
 - `slaCustodia` (custódia SLA do dia)
-- `openSlaDrawer` (drawers de detalhe dos cards)
+- `openSlaDrawer` cases `prev`, `venc`, `vhoje`, `falt` — desde `4403b6b`
+  (todos alinhados com `calcM`)
 - `calcEntregadorSummary` (resumo por entregador)
 
-**Não se aplica a `vencidas`** (prazo passado) — essas já ultrapassaram o prazo independente do horário de entrada.
+> Antes (até `cfb73d3`) vencidas ignoravam a regra. Hoje todas as classificações
+> consultam `entraNoSlaHoje` antes de incluir uma remessa. Testes em
+> `tests/test_diag_audit.py` confirmam o comportamento.
 
 ### 3.4 Custódia
 
@@ -979,5 +1015,294 @@ não está incluída nesta etapa — fica para a próxima rodada (se decidirmos)
 
 ---
 
+## 13. Endpoints de Saúde e Diagnóstico
+
+Tabela completa dos endpoints introduzidos nas etapas P4-P5 (branch
+`dev/profissionalizacao-core`).
+
+### 13.1 Health
+
+| Endpoint | Auth | Custo | Função |
+|---|---|---|---|
+| `GET /healthz` | nenhuma | <1ms | Liveness: responde se o processo está vivo. Útil para `healthcheckPath` no Railway. |
+| `GET /readyz` | nenhuma | <50ms | Readiness: cache populado, `users.db` acessível, `/data` acessível. **Retorna 503 se algum check falha.** |
+| `GET /health/sla` | gestor | 1-3s | Saúde operacional do SLA: counts, SLA%, inconsistências, idade do cache, status `ok/warning/critical`. |
+
+**Status do `/health/sla`** (regra em `_classify_sla_status`):
+- `critical`: inconsistências>0, total_sla=0, idade_cache>1h, ou sla<85%
+- `warning`: idade_cache>30min ou sla<95%
+- `ok`: caso contrário
+
+### 13.2 Auditoria SLA
+
+| Endpoint | Auth | Função |
+|---|---|---|
+| `GET /diag/sla?codigos=A,B,C` | gestor | **Modo legado:** diagnóstico detalhado por código (inclui `motivo` da inclusão/exclusão). Use para investigar uma remessa específica. |
+| `GET /diag/sla?mode=audit` | gestor | **Auditoria do painel.** Resumo + auditoria (idade cache, inconsistências). Default sem detalhes (resposta ~2KB). |
+
+Parâmetros do `mode=audit`:
+
+| Param | Default | Efeito |
+|---|---|---|
+| `op` | — | filtra operação: `gv\|itabira\|jm\|curvelo` |
+| `codigos` | — | filtra códigos específicos (CSV) |
+| `details=1` | 0 | inclui lista `detalhes` por remessa |
+| `categoria` | — | `VENCIDAS\|VENCEM_HOJE\|ENTREGUES_SLA\|CUSTODIA_SLA\|FORA_SLA` |
+| `apenas_inconsistencias=true` | false | só inconsistências estritas |
+| `apenas_excluidas_10h=true` | false | só remessas excluídas pela regra |
+| `limit` | 0 | trunca `detalhes` |
+| `offset` | 0 | paginação |
+| `export=csv` | — | força `details=1` e devolve CSV |
+
+A auditoria roda em thread executor (não bloqueia event loop) e tem log
+de timing: `[diag/audit] op=X dash=N build=Ys classify=Ys total=Ys ...`.
+
+### 13.3 Operacional
+
+| Endpoint | Auth | Função |
+|---|---|---|
+| `POST /admin/rebuild-cache` | DIRETOR | Força `refresh_all()` do zero. Use após mudança de regra ou suspeita de cache inconsistente. |
+| `GET /admin/rebuild-cache` | DIRETOR | Alias para chamar via browser. |
+| `GET /status` | qualquer auth | Resumo por operação (linhas, arquivo, atualizado, erro). |
+
+### 13.4 Como usar via console do navegador
+
+Para chamar qualquer endpoint autenticado sem ferramentas externas:
+
+```javascript
+(async () => {
+  const t = localStorage.getItem('auth_token');
+  const r = await fetch('/diag/sla?mode=audit', {
+    headers: { Authorization: 'Bearer ' + t }
+  });
+  console.log(await r.json());
+})();
+```
+
+---
+
+## 14. Testes e CI
+
+### 14.1 Estrutura
+
+```
+tests/
+├── conftest.py                  # fixtures: today fixo (15/05/2026), cache reset
+├── helpers.py                   # make_row + write_xlsx sintético
+├── test_pe_compute.py           # 9 — _compute_primeira_entrada
+├── test_read_and_merge.py       # 7 — pipeline completo + filtro Hist
+├── test_merge_incremental.py    # 7 — upload incremental, PE preservada
+├── test_entra_no_sla.py         # 10 — regra das 10h, fronteiras
+├── test_diag_audit.py           # 10 — buckets, filtros, paginação, idade cache
+├── test_regressions.py          # 4 — bugs já corrigidos
+├── test_health.py               # 15 — /healthz, /readyz, /health/sla
+├── test_logging.py              # 9 — request_id, formatters, middleware
+└── test_backup_restore.py       # 12 — backup/restore + manifest sha256
+```
+
+**Total: 89 testes em ~3s.**
+
+Cada bug resolvido vira teste permanente (`@pytest.mark.regression`):
+
+| Commit | Teste de regressão |
+|---|---|
+| `879a787` | `test_regression_879a787_proxy_outra_torre_nao_vira_pe` |
+| `3e5ef2f` | `test_3e5ef2f_pe_min_sem_priorizar_hoje` |
+| `4403b6b` | `test_4403b6b_mergeop_nao_cascateia_pe_antiga` |
+| `879a787` (proxy) | `test_879a787_merge_incremental_filtra_hist_no_proxy` |
+
+### 14.2 Como rodar localmente
+
+```bash
+pip install -r requirements-dev.txt   # inclui pytest, ruff, httpx
+
+pytest -q                # 89 testes, ~3s
+pytest -v                # com detalhes
+pytest -m regression     # só testes de regressão
+pytest tests/test_pe_compute.py::test_min_entrada_quando_so_uma_linha  # 1 só
+
+ruff check main.py tests/                     # lint
+python -m compileall -q main.py tests/        # syntax check
+```
+
+### 14.3 CI (GitHub Actions)
+
+Workflow `.github/workflows/ci.yml`, dispara em:
+- `push` em qualquer branch
+- `pull_request` para `main`
+
+Matriz **Python 3.11 + 3.12**, sem deploy, sem segredos:
+1. compileall (syntax)
+2. ruff check
+3. pytest
+
+`concurrency` cancela run anterior se houver novo push no mesmo branch.
+`permissions: contents: read` — workflow não pode commitar nem push.
+
+### 14.4 Branch protection (config manual no GitHub UI)
+
+Recomendado em `Settings → Branches → Add rule` para `main`:
+- ✅ Require status checks: `test (python 3.11)`, `test (python 3.12)`
+- ✅ Require branches up to date before merging
+- ✅ Require pull request before merging
+
+Bloqueia merge direto para `main` sem CI verde.
+
+---
+
+## 15. Observabilidade (logs estruturados e request_id)
+
+### 15.1 Request ID por requisição
+
+Cada requisição recebe um `request_id` único (uuid4 8 bytes):
+
+- **Entrada**: middleware lê `X-Request-ID` do header (se cliente forneceu)
+  ou gera um novo de 12 chars hex.
+- **Durante**: ContextVars (`_request_id_ctx`, `_user_login_ctx`,
+  `_user_role_ctx`) carregam o ID + usuário pela execução inteira da
+  requisição, mesmo em chamadas assíncronas paralelas.
+- **Saída**: middleware devolve `X-Request-ID` no header da response.
+- **Logs**: filter (`_ContextFilter`) injeta os 3 ctxvars em **todo**
+  `LogRecord` automaticamente — não precisou tocar em nenhuma das ~80
+  chamadas `log.info()` existentes.
+
+### 15.2 Formatos
+
+Default (`LOG_JSON=0`):
+
+```
+2026-05-15T18:00:00Z INFO  req=ab12cd34efgh user=admin  [admin] rebuild-cache concluído em 82.13s
+```
+
+JSON (`LOG_JSON=1` no Railway / k8s):
+
+```json
+{"ts":"2026-05-15T21:20:03.005Z","level":"INFO","logger":"api","msg":"...","request_id":"ab12cd34efgh","user":"admin","role":"DIRETOR","event":"rebuild_cache_done","duration_ms":82130.0}
+```
+
+Pronto para Datadog/Loki/Grafana Cloud sem mexer no app.
+
+### 15.3 Eventos marcados (chave `event`)
+
+| Evento | Quando |
+|---|---|
+| `http_request` | toda request (exceto `/healthz` e `/readyz`) |
+| `login_success` / `login_failed` | /auth/login (sem senha) |
+| `upload_started` / `upload_done` | /upload/{tipo} |
+| `rebuild_cache_started` / `rebuild_cache_done` | /admin/rebuild-cache |
+| `refresh_all_done` | ciclo de 300s ou rebuild |
+| `merge_incremental_done` | upload incremental |
+
+### 15.4 Dados sensíveis
+
+- **Middleware não loga body** de request.
+- **Login falho** loga só o login tentado, nunca a senha.
+- **JWT** nunca aparece em log.
+- Teste defensivo `test_login_falho_nao_loga_senha` varre todos os
+  LogRecords e atributos extras confirmando ausência da senha.
+
+---
+
+## 16. Runbook Operacional
+
+### 16.1 "Painel SLA com remessa indevida"
+
+1. Pegue o(s) código(s) suspeito(s).
+2. No console do browser (logado):
+   ```javascript
+   const t = localStorage.getItem('auth_token');
+   fetch('/diag/sla?codigos=COD1,COD2,COD3',
+         {headers:{Authorization:'Bearer '+t}})
+     .then(r=>r.json()).then(j=>console.table(j.diagnostico));
+   ```
+3. Olhe `entraNoSlaHoje` + `motivo` para cada código.
+4. Se `motivo` indica que entraNoSlaHoje retornou correto (false) mas
+   a remessa ainda aparece no painel: **hard refresh** (Ctrl+Shift+R)
+   para descartar opMap stale do navegador.
+5. Se PE está claramente errada no backend: rode
+   `POST /admin/rebuild-cache` para forçar `refresh_all`.
+
+### 16.2 "Cache muito velho"
+
+- `GET /health/sla` mostra `idade_cache_segundos`.
+- Refresh automático roda a cada 300s.
+- Para forçar agora: `POST /admin/rebuild-cache` (Diretor).
+- Causa típica: o `_background_refresh` morreu — restart do processo
+  no Railway resolve.
+
+### 16.3 "Login bloqueando"
+
+- Sem rate-limit ainda. Tentativas falhas viram log
+  `[auth] login falhou para 'X'` com `event=login_failed`.
+- Senha esquecida: Diretor pode resetar via `POST /usuarios/{uid}/reset-senha`.
+
+### 16.4 "Quero entender o que aconteceu numa request específica"
+
+- Pegue `X-Request-ID` da response (header).
+- Grep no log do Railway por `req=<id>` (formato text) ou
+  `request_id":"<id>"` (formato JSON).
+- Todos os logs daquela request aparecem em sequência, com `event` tags.
+
+### 16.5 "Preciso reverter para versão anterior"
+
+- `git checkout <commit-anterior>` localmente.
+- Não tem CI bloqueando reverter (mas se tiver branch protection ativa,
+  reverter requer PR).
+- **Dados** (xlsx, users.db) NÃO são versionados — usar `tools/restore_data.py`
+  com um backup recente (ver Seção 12).
+
+### 16.6 "Suspeita de dados de produção corrompidos"
+
+- Pegue um backup recente: `python tools/backup_data.py` (rodando contra `/data` da prod).
+- Valide com `--dry-run`: confere sha256 sem extrair.
+- Se precisar restaurar, **sempre** use `--allow-production` consciente
+  e tenha pré-backup recente. Ver Seção 12.5.
+
+---
+
+## 17. Fluxo Dev → Produção
+
+```
+Trabalho                         Branch                          Deploy
+═══════════════════════════════════════════════════════════════════════
+Implementação local              dev/profissionalizacao-core     —
+  ↓ pytest verde + ruff verde
+PR para main                     PR aberto                       CI roda
+  ↓ revisão + CI verde
+Merge para main                  main                            Railway redeploya
+  ↓ startup roda refresh_all
+Produção atualizada              —                               novos endpoints ativos
+```
+
+### 17.1 Regras invioláveis
+
+1. **Nada vai pra `main` sem CI verde.**
+2. **Toda regra de negócio nova vem com teste.**
+3. **Bug corrigido vira teste de regressão** com referência ao commit.
+4. **Frontend não duplica regra do backend.** Se uma lógica vive nos dois,
+   o backend é a fonte de verdade; frontend só consome.
+5. **Logs estruturados são padrão.** Eventos importantes ganham `event=...`.
+6. **`POST /admin/rebuild-cache` é a maneira certa de forçar reset do cache.**
+   Não há outro caminho seguro em produção.
+
+### 17.2 Configuração do Railway (não automatizado ainda)
+
+Para ativar healthcheck quando estabilizar:
+
+```toml
+# railway.toml
+[deploy]
+healthcheckPath = "/readyz"
+healthcheckTimeout = 120
+```
+
+Para logs JSON (recomendado quando integrar com observabilidade externa):
+
+```
+LOG_JSON=1
+```
+
+---
+
 *Documento mantido por: André Teles / equipe de desenvolvimento*  
-*Última atualização: 2026-05-15 — branch `dev/profissionalizacao-core` (P1-P7)*
+*Última atualização: 2026-05-15 (rev4) — branch `dev/profissionalizacao-core` (P1-P8)*
