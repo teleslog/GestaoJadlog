@@ -162,7 +162,9 @@ def test_read_history_le_global(snap_env, make_row, today):
     ]})
     snap = backend._take_sla_snapshot()
     assert snap is not None
-    today_d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Derivar a data do próprio snapshot — independente do relógio do CI.
+    # (O fixture `today` mocka backend.datetime mas não o `datetime` deste módulo.)
+    today_d = snap["ts"][:10]
     points = backend._read_sla_history(today_d)
     assert len(points) == 1
     assert "sla_percentual" in points[0]
@@ -176,8 +178,9 @@ def test_read_history_por_operacao(snap_env, make_row, today):
                  **{"__primeira_entrada": "14/05/2026 09:00:00",
                     "__pe_proxy": False}),
     ]})
-    backend._take_sla_snapshot(force=True)
-    today_d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    snap = backend._take_sla_snapshot(force=True)
+    assert snap is not None
+    today_d = snap["ts"][:10]
     points_gv = backend._read_sla_history(today_d, op="gv")
     points_jm = backend._read_sla_history(today_d, op="jm")
     assert len(points_gv) == 1
