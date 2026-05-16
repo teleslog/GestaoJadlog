@@ -1,0 +1,54 @@
+[project]
+name = "gestaoentregas"
+version = "0.0.0"
+description = "GestãoEntregas — Dashboard operacional Jadlog"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+  "-q",
+]
+filterwarnings = [
+  "ignore::UserWarning:openpyxl",
+  "ignore::DeprecationWarning",
+]
+markers = [
+  "regression: testes que cobrem bugs específicos já corrigidos",
+  "slow: testes que envolvem leitura de xlsx grande (não roda em CI default)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [
+  "tools/",
+  "screenshots/",
+  ".claude/",
+  "take_screenshots.py",
+  "validate_before_push.py",
+]
+
+[tool.ruff.lint]
+# Conjunto enxuto: erros de sintaxe + import + bugs comuns.
+# Sem regras de estilo agressivas (não é momento de refactor).
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+  "E501",  # line-too-long: ruff format trata
+  "B008",  # FastAPI usa Depends() como default
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E402"]  # imports tardios em conftest
+# Tolerância em main.py até refactor planejado (não alterar regras críticas
+# de SLA sem teste correspondente). CI ainda valida import/bugs reais.
+"main.py" = ["E702", "B904", "B905"]
+
+[tool.ruff.format]
+quote-style = "double"

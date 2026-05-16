@@ -290,6 +290,40 @@ tr:hover td{background:#FFF5F5;}
 .entr-tbl td{color:#1A1A1A;font-size:12px;padding:5px 16px;border-bottom:1px solid #F5F5F5;white-space:nowrap;}
 .entr-tbl-wrap{overflow-x:auto;}
 .entr-tbl tr:hover td{background:#FFF5F5;}
+
+/* ── Auditoria SLA (FASE 2) ─────────────────────────────────────────── */
+.au-card{background:#FAFAFA;border:1px solid #EEE;border-radius:6px;padding:10px 12px;text-align:center;}
+.au-card .lbl{font-size:9px;color:#888;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:4px;}
+.au-card .val{font-size:20px;font-weight:700;color:#1A1A1A;}
+.au-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle;}
+.au-dot.red{background:#CC0000;box-shadow:0 0 0 2px rgba(204,0,0,0.15);}
+.au-dot.yellow{background:#E5A100;box-shadow:0 0 0 2px rgba(229,161,0,0.15);}
+.au-dot.green{background:#22A05B;box-shadow:0 0 0 2px rgba(34,160,91,0.15);}
+.au-dot.gray{background:#999;box-shadow:0 0 0 2px rgba(153,153,153,0.15);}
+#au-tbl tbody tr.au-row-red{background:#FFF2F2;}
+#au-tbl tbody tr.au-row-yellow{background:#FFFCEC;}
+#au-tbl tbody tr.au-row-gray{background:#FAFAFA;color:#666;}
+#au-tbl tbody tr:hover td{background:#F5F5F5;}
+.au-mono{font-family:Consolas,Menlo,monospace;font-size:11px;}
+.au-pe-real{color:#22A05B;font-weight:600;}
+.au-pe-proxy{color:#E5A100;font-weight:600;}
+.au-pe-empty{color:#AAA;font-style:italic;}
+
+/* ── Tendência SLA (snapshots temporais) ───────────────────────────── */
+.tend-card{background:#FAFAFA;border:1px solid #EEE;border-radius:6px;padding:12px 14px;}
+.tend-card .lbl{font-size:9px;color:#888;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:4px;}
+.tend-card .val{font-size:22px;font-weight:700;color:#1A1A1A;}
+.tend-card .sub{font-size:10px;color:#999;margin-top:4px;}
+.tend-card.ok .val{color:#22A05B;}
+.tend-card.warn .val{color:#E5A100;}
+.tend-card.crit .val{color:#CC0000;}
+#tend-svg .axis{stroke:#DDD;stroke-width:1;}
+#tend-svg .gridline{stroke:#F0F0F0;stroke-width:1;}
+#tend-svg .axis-label{fill:#888;font-size:10px;font-family:Inter,sans-serif;}
+#tend-svg .sla-line{fill:none;stroke:#E1262E;stroke-width:2;}
+#tend-svg .sla-area{fill:#E1262E;fill-opacity:0.08;}
+#tend-svg .point{fill:#E1262E;}
+#tend-svg .meta{stroke:#22A05B;stroke-width:1;stroke-dasharray:4 4;}
 </style>
 </head>
 <body>
@@ -424,10 +458,12 @@ tr:hover td{background:#FFF5F5;}
     <div class="nav-item" onclick="nav('despesas',this)"><span class="nav-icon">📋</span>Lançamentos</div>
     <div class="nav-group">SLA</div>
     <div class="nav-item" onclick="nav('sla-acumulado',this)"><span class="nav-icon">📈</span>SLA Acumulado</div>
+    <div class="nav-item" onclick="nav('tendencia',this)"><span class="nav-icon">⏱️</span>Tendência SLA</div>
     <div class="nav-group" id="nav-group-importar" style="display:none">Importação</div>
     <div class="nav-item" id="nav-importar" onclick="nav('importar',this)" style="display:none"><span class="nav-icon">📤</span>Importar Arquivos</div>
     <div class="nav-group" id="nav-group-admin" style="display:none">Administração</div>
     <div class="nav-item" id="nav-admin" onclick="nav('admin',this)" style="display:none"><span class="nav-icon">⚙️</span>Usuários</div>
+    <div class="nav-item" id="nav-auditoria" onclick="nav('auditoria',this)" style="display:none"><span class="nav-icon">🔬</span>Auditoria SLA</div>
   </nav>
   <div class="sidebar-footer">
     <div class="clock" id="clock"></div>
@@ -530,6 +566,175 @@ tr:hover td{background:#FFF5F5;}
       </div>
       <div class="panel">
         <div id="admin-users-body"><div class="empty">Carregando...</div></div>
+      </div>
+    </div>
+
+    <!-- AUDITORIA SLA (DIRETOR) -->
+    <div class="page" id="page-auditoria">
+      <!-- Resumo -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="panel-hdr">
+          <div class="panel-title">Resumo SLA</div>
+          <div style="font-size:10px;color:#888" id="au-cache-info">—</div>
+        </div>
+        <div id="au-summary-strip" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;padding:10px 12px"></div>
+      </div>
+
+      <!-- Filtros -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="panel-hdr">
+          <div class="panel-title">Filtros de investigação</div>
+          <div style="display:flex;gap:6px">
+            <button class="hbtn" onclick="loadAuditPage()">↻ Atualizar</button>
+            <button class="hbtn" onclick="exportAuditCsv()" style="border-color:var(--green);color:var(--green)">⬇ CSV</button>
+          </div>
+        </div>
+        <div class="filters" style="flex-wrap:wrap;padding:10px 12px;gap:8px">
+          <select class="si" id="au-op">
+            <option value="">Todas as operações</option>
+            <option value="gv">GV Valadares</option>
+            <option value="itabira">Itabira</option>
+            <option value="jm">João Monlevade</option>
+            <option value="curvelo">Curvelo</option>
+          </select>
+          <select class="si" id="au-status">
+            <option value="">Todos os status</option>
+            <option>ENTREGUE</option>
+            <option>ENTREGUE NO PICKUP</option>
+            <option>EM ROTA</option>
+            <option>EM ROTA PICKUP</option>
+            <option>ENTRADA</option>
+            <option>CUSTODIA</option>
+            <option>TRAVADO</option>
+          </select>
+          <select class="si" id="au-categoria">
+            <option value="">Toda categoria SLA</option>
+            <option>VENCIDAS</option>
+            <option>VENCEM_HOJE</option>
+            <option>ENTREGUES_SLA</option>
+            <option>CUSTODIA_SLA</option>
+            <option>FORA_SLA</option>
+          </select>
+          <select class="si" id="au-entra">
+            <option value="">Entra SLA: ambos</option>
+            <option value="true">Só entra</option>
+            <option value="false">Só excluídas (regra 10h)</option>
+          </select>
+          <select class="si" id="au-badge">
+            <option value="">Todas as cores</option>
+            <option value="red">🔴 Inconsistência</option>
+            <option value="yellow">🟡 Fallback</option>
+            <option value="green">🟢 Validado</option>
+            <option value="gray">⚪ Excluído SLA</option>
+          </select>
+          <input type="text" class="di" id="au-codigos" placeholder="Códigos (CSV)" style="width:200px">
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#666">
+            <input type="checkbox" id="au-inc" style="cursor:pointer"> Só inconsistências
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#666">
+            <input type="checkbox" id="au-susp" style="cursor:pointer"> Só suspeitas
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#666">
+            <input type="checkbox" id="au-fb" style="cursor:pointer"> Só fallback
+          </label>
+          <button class="hbtn" onclick="loadAuditPage()" style="background:var(--red);color:white;border-color:var(--red)">Aplicar</button>
+        </div>
+      </div>
+
+      <!-- Tabela -->
+      <div class="panel">
+        <div class="panel-hdr">
+          <div class="panel-title" id="au-result-title">Resultados</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="hbtn" id="au-prev" onclick="auditPage(-1)" disabled>← Anterior</button>
+            <span id="au-page-info" style="font-size:11px;color:#666">—</span>
+            <button class="hbtn" id="au-next" onclick="auditPage(1)" disabled>Próxima →</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="dash-tbl" id="au-tbl">
+            <thead><tr>
+              <th></th>
+              <th>Código</th>
+              <th>Op</th>
+              <th>Status</th>
+              <th>Dt Evento</th>
+              <th>Previsão</th>
+              <th>PE</th>
+              <th>Origem PE</th>
+              <th>Entra SLA</th>
+              <th>Categoria</th>
+              <th>Motivo</th>
+            </tr></thead>
+            <tbody id="au-tb"><tr><td colspan="11" style="padding:30px;text-align:center;color:#888">Selecione filtros e clique em "Aplicar".</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TENDÊNCIA SLA -->
+    <div class="page" id="page-tendencia">
+      <div class="panel" style="margin-bottom:14px">
+        <div class="panel-hdr">
+          <div class="panel-title">Filtros</div>
+          <div style="display:flex;gap:6px">
+            <button class="hbtn" onclick="loadTendencia()">↻ Atualizar</button>
+          </div>
+        </div>
+        <div class="filters" style="padding:10px 12px;gap:8px;flex-wrap:wrap">
+          <input type="date" class="di" id="tend-date">
+          <select class="si" id="tend-op">
+            <option value="">Global (todas as operações)</option>
+            <option value="gv">GV Valadares</option>
+            <option value="itabira">Itabira</option>
+            <option value="jm">João Monlevade</option>
+            <option value="curvelo">Curvelo</option>
+          </select>
+          <select class="si" id="tend-interval">
+            <option value="0">Sem amostragem (todos os pontos)</option>
+            <option value="5">A cada 5 minutos</option>
+            <option value="15">A cada 15 minutos</option>
+            <option value="30">A cada 30 minutos</option>
+            <option value="60">A cada 60 minutos</option>
+          </select>
+          <button class="hbtn" onclick="loadTendencia()" style="background:var(--red);color:white;border-color:var(--red)">Aplicar</button>
+        </div>
+      </div>
+
+      <!-- Mini-cards -->
+      <div id="tend-cards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px"></div>
+
+      <!-- Gráfico SVG -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="panel-hdr">
+          <div class="panel-title" id="tend-chart-title">Evolução do SLA — sem dados</div>
+        </div>
+        <div style="padding:12px 12px 6px 12px">
+          <svg id="tend-svg" viewBox="0 0 1000 320" preserveAspectRatio="xMidYMid meet" style="width:100%;max-height:340px"></svg>
+        </div>
+      </div>
+
+      <!-- Tabela de pontos -->
+      <div class="panel">
+        <div class="panel-hdr">
+          <div class="panel-title" id="tend-table-title">Pontos coletados</div>
+        </div>
+        <div style="overflow-x:auto;max-height:320px;overflow-y:auto">
+          <table class="dash-tbl" id="tend-tbl">
+            <thead><tr>
+              <th>Hora</th>
+              <th>SLA %</th>
+              <th>Previstas</th>
+              <th>Vencidas</th>
+              <th>Vence hoje</th>
+              <th>Entregues</th>
+              <th>Custódia</th>
+              <th>Faltam</th>
+              <th>Inconsist.</th>
+            </tr></thead>
+            <tbody id="tend-tb"><tr><td colspan="9" style="padding:30px;text-align:center;color:#888">Carregando...</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -1216,11 +1421,13 @@ function _updateAuthUI(){
     sideUser.style.display=_authToken?'block':'none';
     sideUser.textContent=_authLogin+' · '+(_ROLE_LABELS[_authRole]||_authRole);
   }
-  // Diretor: Usuários
+  // Diretor: Usuários + Auditoria SLA
   const navGrpAdmin=document.getElementById('nav-group-admin');
   const navAdmin=document.getElementById('nav-admin');
+  const navAud=document.getElementById('nav-auditoria');
   if(navGrpAdmin)navGrpAdmin.style.display=isAdmin?'':'none';
   if(navAdmin)navAdmin.style.display=isAdmin?'':'none';
+  if(navAud)navAud.style.display=isAdmin?'':'none';
   // Diretor+Supervisão: Importar
   const navGrpImp=document.getElementById('nav-group-importar');
   const navImp=document.getElementById('nav-importar');
@@ -3363,7 +3570,9 @@ function nav(page,el){
     entregador:'Remessas por Entregador',cidade:'Remessas por Cidade',
     consultas:'Consultas / Histórico',despesas:'Despesas — Lançamentos',
     'sla-acumulado':'SLA Acumulado',
+    tendencia:'Tendência SLA — evolução do dia',
     admin:'Administração — Usuários',
+    auditoria:'Auditoria SLA',
     importar:'Importar Arquivos Excel',
   };
   document.getElementById('page-title').textContent=titles[page]||page;
@@ -3373,8 +3582,304 @@ function nav(page,el){
   if(page==='total')renderFinPage('tot');
   if(page==='despesas')loadDespesas();
   if(page==='sla-acumulado')renderSlaAcumulado();
+  if(page==='tendencia')loadTendencia();
   if(page==='admin')_loadAdminUsers();
+  if(page==='auditoria')loadAuditPage();
   if(page==='importar')_loadImportStatus();
+}
+
+// ── AUDITORIA SLA (FASE 2 — DIRETOR) ──────────────────────────────────────────
+// Tela de investigação técnica do SLA. Consome /audit/sla (backend já calcula
+// tudo). Sem regra paralela no frontend; só renderiza.
+
+const AU_PAGE_SIZE = 100;
+let _auOffset = 0;
+let _auLastTotal = 0;
+
+function _auGetFilters(){
+  const op = document.getElementById('au-op').value;
+  const status = document.getElementById('au-status').value;
+  const categoria = document.getElementById('au-categoria').value;
+  const entra = document.getElementById('au-entra').value;
+  const badge = document.getElementById('au-badge').value;
+  const codigos = (document.getElementById('au-codigos').value || '').trim();
+  const inc = document.getElementById('au-inc').checked;
+  const susp = document.getElementById('au-susp').checked;
+  const fb = document.getElementById('au-fb').checked;
+  const qs = new URLSearchParams();
+  if (op) qs.set('op', op);
+  if (status) qs.set('status', status);
+  if (categoria) qs.set('categoria', categoria);
+  if (entra) qs.set('entra_no_sla', entra);
+  if (codigos) qs.set('codigos', codigos);
+  if (inc) qs.set('apenas_inconsistencias', 'true');
+  if (susp) qs.set('apenas_suspeitas', 'true');
+  if (fb) qs.set('apenas_fallback', 'true');
+  qs.set('limit', AU_PAGE_SIZE);
+  qs.set('offset', _auOffset);
+  return { qs: qs.toString(), badge };
+}
+
+async function loadAuditPage(reset = true){
+  if (reset) _auOffset = 0;
+  const tb = document.getElementById('au-tb');
+  tb.innerHTML = '<tr><td colspan="11" style="padding:30px;text-align:center;color:#888">Carregando...</td></tr>';
+  const { qs, badge } = _auGetFilters();
+  try{
+    const r = await fetch(API_BASE + '/audit/sla?' + qs, { headers: _authHeaders() });
+    if (r.status === 403){
+      tb.innerHTML = '<tr><td colspan="11" style="padding:30px;text-align:center;color:#CC0000">Acesso restrito ao Diretor.</td></tr>';
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    _renderAuditSummary(data);
+    _renderAuditTable(data, badge);
+  } catch(e){
+    tb.innerHTML = '<tr><td colspan="11" style="padding:30px;text-align:center;color:#CC0000">Erro: ' + e.message + '</td></tr>';
+  }
+}
+
+function auditPage(direction){
+  _auOffset = Math.max(0, _auOffset + direction * AU_PAGE_SIZE);
+  loadAuditPage(false);
+}
+
+function _renderAuditSummary(data){
+  const r = data.resumo || {};
+  const a = data.auditoria || {};
+  const cards = [
+    { lbl: 'Dashboard', val: (r.dashboard_total || 0).toLocaleString('pt-BR') },
+    { lbl: 'No SLA', val: (r.total_sla || 0).toLocaleString('pt-BR') },
+    { lbl: 'Vencidas', val: r.vencidas || 0 },
+    { lbl: 'Vencem hoje', val: r.vencem_hoje || 0 },
+    { lbl: 'Entregues SLA', val: r.entregues_sla || 0 },
+    { lbl: 'Custódia SLA', val: r.custodia_sla || 0 },
+    { lbl: 'SLA %', val: (r.sla_percentual || 0).toFixed(2) + '%' },
+    { lbl: 'Excluídas 10h', val: a.total_excluidas_10h || 0 },
+    { lbl: 'Inconsistências', val: a.inconsistencias || 0 },
+    { lbl: 'Suspeitas', val: a.remessas_suspeitas || 0 },
+  ];
+  document.getElementById('au-summary-strip').innerHTML =
+    cards.map(c => `<div class="au-card"><div class="lbl">${c.lbl}</div><div class="val">${c.val}</div></div>`).join('');
+  const idade = a.idade_cache_segundos;
+  const ts = a.ultima_atualizacao_cache || '—';
+  const idadeFmt = idade === null || idade === undefined ? '—' :
+    idade < 60 ? idade + 's' : Math.floor(idade / 60) + 'min ' + (idade % 60) + 's';
+  document.getElementById('au-cache-info').textContent =
+    `Cache atualizado: ${ts} · idade: ${idadeFmt}`;
+}
+
+function _renderAuditTable(data, badgeFilter){
+  let rows = data.detalhes || [];
+  if (badgeFilter) rows = rows.filter(r => r.badge === badgeFilter);
+  const total = data.detalhes_total_filtrado || 0;
+  _auLastTotal = total;
+  document.getElementById('au-result-title').textContent =
+    `Resultados — ${rows.length} de ${total.toLocaleString('pt-BR')} remessas`;
+  const totalPages = Math.max(1, Math.ceil(total / AU_PAGE_SIZE));
+  const curPage = Math.floor(_auOffset / AU_PAGE_SIZE) + 1;
+  document.getElementById('au-page-info').textContent = `Página ${curPage} de ${totalPages}`;
+  document.getElementById('au-prev').disabled = _auOffset <= 0;
+  document.getElementById('au-next').disabled = (_auOffset + AU_PAGE_SIZE) >= total;
+  if (!rows.length){
+    document.getElementById('au-tb').innerHTML =
+      '<tr><td colspan="11" style="padding:30px;text-align:center;color:#888">Nenhuma remessa corresponde aos filtros.</td></tr>';
+    return;
+  }
+  document.getElementById('au-tb').innerHTML = rows.map(r => _auRow(r)).join('');
+}
+
+function _esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function _auRow(r){
+  const badge = r.badge || 'gray';
+  const peStr = r.primeira_entrada_valida || '';
+  const peCls = !peStr ? 'au-pe-empty' : (r.pe_proxy ? 'au-pe-proxy' : 'au-pe-real');
+  const peTxt = peStr || '(vazio)';
+  const peOrigin = !peStr ? 'fallback' : (r.pe_proxy ? 'PE proxy' : 'PE real');
+  return `<tr class="au-row-${badge}">
+    <td><span class="au-dot ${badge}" title="${badge}"></span></td>
+    <td class="au-mono"><b>${_esc(r.codigo)}</b></td>
+    <td>${_esc(r.operacao)}</td>
+    <td>${_esc(r.status_atual)}</td>
+    <td class="au-mono">${_esc(r.dt_evento)}</td>
+    <td class="au-mono">${_esc(r.previsao)}</td>
+    <td class="au-mono ${peCls}">${_esc(peTxt)}</td>
+    <td>${peOrigin}</td>
+    <td>${r.entrou_no_sla ? '<span style="color:#22A05B;font-weight:600">✓ entra</span>' : '<span style="color:#999">— excluída</span>'}</td>
+    <td>${_esc(r.categoria_sla)}</td>
+    <td style="max-width:280px;white-space:normal;font-size:11px;color:#666">${_esc(r.motivo)}${r.tipo_inconsistencia ? '<br><b style="color:#CC0000">⚠ ' + _esc(r.tipo_inconsistencia) + '</b>' : ''}</td>
+  </tr>`;
+}
+
+async function exportAuditCsv(){
+  const { qs } = _auGetFilters();
+  // export=csv força details=1 e devolve CSV — mesma rota do /diag/sla?mode=audit
+  const params = new URLSearchParams(qs);
+  params.set('export', 'csv');
+  params.delete('limit');
+  params.delete('offset');
+  const r = await fetch(API_BASE + '/diag/sla?mode=audit&' + params.toString(),
+                        { headers: _authHeaders() });
+  if (!r.ok){ alert('Erro ao gerar CSV: HTTP ' + r.status); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'auditoria_sla_' + new Date().toISOString().slice(0, 10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── TENDÊNCIA SLA (snapshots temporais) ──────────────────────────────────────
+// Lê GET /health/sla/history e desenha gráfico SVG simples (sem libs externas).
+
+let _tendPoints = [];
+
+async function loadTendencia(){
+  const dateInp = document.getElementById('tend-date');
+  if (!dateInp.value){
+    dateInp.value = new Date().toISOString().slice(0, 10);
+  }
+  const date = dateInp.value;
+  const op = document.getElementById('tend-op').value;
+  const interval = document.getElementById('tend-interval').value;
+  const qs = new URLSearchParams({ date });
+  if (op) qs.set('op', op);
+  if (interval && interval !== '0') qs.set('interval', interval);
+  document.getElementById('tend-tb').innerHTML =
+    '<tr><td colspan="9" style="padding:30px;text-align:center;color:#888">Carregando...</td></tr>';
+  try{
+    const r = await fetch(API_BASE + '/health/sla/history?' + qs.toString(),
+                          { headers: _authHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    _tendPoints = data.points || [];
+    _renderTendencia(data);
+  }catch(e){
+    document.getElementById('tend-tb').innerHTML =
+      '<tr><td colspan="9" style="padding:30px;text-align:center;color:#CC0000">Erro: ' + e.message + '</td></tr>';
+  }
+}
+
+function _renderTendencia(data){
+  const pts = _tendPoints;
+  const opLbl = data.op || 'global';
+
+  // Mini-cards
+  if (!pts.length){
+    document.getElementById('tend-cards').innerHTML =
+      '<div class="tend-card"><div class="lbl">SEM DADOS</div><div class="val">—</div><div class="sub">Snapshot ainda não capturado para esta data</div></div>';
+    document.getElementById('tend-chart-title').textContent = 'Evolução do SLA — sem dados';
+    document.getElementById('tend-svg').innerHTML = '';
+    document.getElementById('tend-table-title').textContent = 'Pontos coletados — 0';
+    document.getElementById('tend-tb').innerHTML =
+      '<tr><td colspan="9" style="padding:30px;text-align:center;color:#888">Sem dados para essa combinação. Snapshots automáticos rodam após cada refresh (5 min).</td></tr>';
+    return;
+  }
+  const slaVals = pts.map(p => Number(p.sla_percentual ?? 0));
+  const cur = slaVals[slaVals.length - 1];
+  const min = Math.min(...slaVals);
+  const max = Math.max(...slaVals);
+  const avg = slaVals.reduce((a, b) => a + b, 0) / slaVals.length;
+  const cls = (v) => v >= 95 ? 'ok' : v >= 85 ? 'warn' : 'crit';
+  document.getElementById('tend-cards').innerHTML = [
+    `<div class="tend-card ${cls(cur)}"><div class="lbl">SLA Atual</div><div class="val">${cur.toFixed(2)}%</div><div class="sub">${pts.length} ponto(s)</div></div>`,
+    `<div class="tend-card ${cls(min)}"><div class="lbl">SLA Mínimo</div><div class="val">${min.toFixed(2)}%</div></div>`,
+    `<div class="tend-card ${cls(max)}"><div class="lbl">SLA Máximo</div><div class="val">${max.toFixed(2)}%</div></div>`,
+    `<div class="tend-card ${cls(avg)}"><div class="lbl">SLA Médio</div><div class="val">${avg.toFixed(2)}%</div></div>`,
+  ].join('');
+
+  document.getElementById('tend-chart-title').textContent =
+    `Evolução do SLA — ${data.date} · ${opLbl} · ${pts.length} ponto(s)`;
+  _drawTendenciaSvg(pts);
+
+  // Tabela
+  document.getElementById('tend-table-title').textContent =
+    `Pontos coletados — ${pts.length}`;
+  document.getElementById('tend-tb').innerHTML = pts.map(p => {
+    const t = (p.ts || '').slice(11, 16);
+    const sla = Number(p.sla_percentual ?? 0).toFixed(2);
+    return `<tr>
+      <td>${t}</td>
+      <td><b>${sla}%</b></td>
+      <td>${p.total_sla ?? 0}</td>
+      <td>${p.vencidas ?? 0}</td>
+      <td>${p.vencem_hoje ?? 0}</td>
+      <td>${p.entregues_sla ?? 0}</td>
+      <td>${p.custodia_sla ?? 0}</td>
+      <td>${p.faltam ?? 0}</td>
+      <td>${p.inconsistencias ?? 0}</td>
+    </tr>`;
+  }).join('');
+}
+
+function _drawTendenciaSvg(pts){
+  // viewBox: 1000 x 320
+  const W = 1000, H = 320, PAD_L = 50, PAD_R = 20, PAD_T = 20, PAD_B = 40;
+  const PW = W - PAD_L - PAD_R, PH = H - PAD_T - PAD_B;
+  const META = 98;
+
+  // X: tempo (do primeiro ao último timestamp). Y: 0% a 100%.
+  const ts = pts.map(p => {
+    const m = (p.ts || '').match(/T(\d{2}):(\d{2}):/);
+    return m ? (+m[1]) * 60 + (+m[2]) : 0;
+  });
+  const xmin = Math.min(...ts), xmax = Math.max(...ts);
+  const xrange = Math.max(1, xmax - xmin);
+  const xpos = (t) => PAD_L + ((t - xmin) / xrange) * PW;
+  const ypos = (v) => PAD_T + (1 - Math.max(0, Math.min(100, v)) / 100) * PH;
+
+  // Path da linha + área
+  let line = '', area = '';
+  pts.forEach((p, i) => {
+    const x = xpos(ts[i]);
+    const y = ypos(Number(p.sla_percentual ?? 0));
+    line += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+    area += (i === 0 ? 'M' + x.toFixed(1) + ' ' + (PAD_T + PH).toFixed(1) + 'L' : 'L')
+          + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+  });
+  if (pts.length) area += 'L' + xpos(ts[pts.length - 1]).toFixed(1) + ' ' + (PAD_T + PH).toFixed(1) + ' Z';
+
+  // Gridlines y a cada 20% + label
+  let grid = '';
+  for (let v = 0; v <= 100; v += 20){
+    const y = ypos(v).toFixed(1);
+    grid += `<line class="gridline" x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}"/>`;
+    grid += `<text class="axis-label" x="${PAD_L - 8}" y="${(+y) + 4}" text-anchor="end">${v}%</text>`;
+  }
+  // Linha de meta 98
+  const ymeta = ypos(META).toFixed(1);
+  grid += `<line class="meta" x1="${PAD_L}" y1="${ymeta}" x2="${W - PAD_R}" y2="${ymeta}"/>`;
+  grid += `<text class="axis-label" x="${W - PAD_R}" y="${(+ymeta) - 4}" text-anchor="end" fill="#22A05B">meta ${META}%</text>`;
+  // Eixo X com 6 marcas
+  let xax = '';
+  for (let i = 0; i <= 5; i++){
+    const frac = i / 5;
+    const x = PAD_L + frac * PW;
+    const t = xmin + frac * xrange;
+    const h = Math.floor(t / 60), m = Math.floor(t % 60);
+    const lbl = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+    xax += `<line class="gridline" x1="${x}" y1="${PAD_T}" x2="${x}" y2="${PAD_T + PH}"/>`;
+    xax += `<text class="axis-label" x="${x}" y="${PAD_T + PH + 14}" text-anchor="middle">${lbl}</text>`;
+  }
+
+  // Pontos
+  let dots = '';
+  pts.forEach((p, i) => {
+    const x = xpos(ts[i]), y = ypos(Number(p.sla_percentual ?? 0));
+    dots += `<circle class="point" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.5"/>`;
+  });
+
+  document.getElementById('tend-svg').innerHTML =
+    grid + xax +
+    `<path class="sla-area" d="${area}"/>` +
+    `<path class="sla-line" d="${line}"/>` +
+    dots +
+    `<line class="axis" x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${PAD_T + PH}"/>` +
+    `<line class="axis" x1="${PAD_L}" y1="${PAD_T + PH}" x2="${W - PAD_R}" y2="${PAD_T + PH}"/>`;
 }
 
 // ── INICIALIZAÇÃO AUTOMÁTICA ──────────────────────────────────────────────────

@@ -32,13 +32,17 @@ Endpoints ADMIN:
 """
 
 import asyncio
+import contextvars
 import io
+import json as _json_logging
 import logging
 import os
+import random as _random
 import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading as _threading
 import time
 import uuid
 import zipfile
@@ -47,13 +51,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import bcrypt as _bcrypt
 import pandas as pd
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-import bcrypt as _bcrypt
 from pydantic import BaseModel
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
@@ -64,6 +68,15 @@ JWT_ALGORITHM          = "HS256"
 JWT_EXPIRE_HOURS       = 12
 DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Jadlog2026")[:72]
 
+# Rate-limit do /auth/login. Configurar via env. Definir qualquer um como 0 desliga.
+RATE_LIMIT_LOGIN_ATTEMPTS = int(os.environ.get("RATE_LIMIT_LOGIN_ATTEMPTS", "5"))
+RATE_LIMIT_LOGIN_WINDOW   = int(os.environ.get("RATE_LIMIT_LOGIN_WINDOW", "60"))
+
+# Snapshots temporais do SLA — persiste em JSONL diário.
+SNAPSHOT_ENABLED         = os.environ.get("SNAPSHOT_ENABLED", "1") == "1"
+SNAPSHOT_MIN_INTERVAL_S  = int(os.environ.get("SNAPSHOT_MIN_INTERVAL_S", "60"))
+SNAPSHOT_RETENTION_DAYS  = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "30"))
+
 BASE_DIR  = Path(__file__).parent
 DASHBOARD = BASE_DIR / "GestãoEntregas.html"
 
@@ -71,9 +84,86 @@ DASHBOARD = BASE_DIR / "GestãoEntregas.html"
 _DATA_ROOT = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
 FIN_DIR    = _DATA_ROOT / "dados" / "financeiro"
 OP_DIR     = _DATA_ROOT / "dados" / "operacional"
+SNAP_DIR   = _DATA_ROOT / "dados" / "snapshots"
 DB_PATH    = Path(os.environ.get("DB_PATH", str(_DATA_ROOT / "users.db")))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+# ── LOGGING ESTRUTURADO ────────────────────────────────────────────────────────
+# Cada request tem um request_id (gerado se não vier no header). Filter injeta
+# request_id + user nos LogRecords automaticamente — sem precisar mexer em
+# cada log.info() existente. Formato controlado por env LOG_JSON.
+
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+_user_login_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("user_login", default="-")
+_user_role_ctx:  contextvars.ContextVar[str] = contextvars.ContextVar("user_role",  default="-")
+
+LOG_JSON = os.environ.get("LOG_JSON", "0") == "1"
+
+# Campos que viram chaves de primeiro nível no JSON quando passados via extra={}.
+_EXTRA_LOG_FIELDS = {
+    "event", "method", "route", "status_code", "duration_ms",
+    "operacao", "codigo", "arquivo", "linhas", "key", "tipo", "erro",
+    "ip", "retry_after_s",
+}
+
+
+class _ContextFilter(logging.Filter):
+    """Injeta request_id + user em todo LogRecord."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_ctx.get()
+        record.user_login = _user_login_ctx.get()
+        record.user_role  = _user_role_ctx.get()
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    """Formato estruturado para logs (1 linha = 1 JSON)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "request_id": getattr(record, "request_id", "-"),
+            "user": getattr(record, "user_login", "-"),
+            "role": getattr(record, "user_role", "-"),
+        }
+        for k in _EXTRA_LOG_FIELDS:
+            v = getattr(record, k, None)
+            if v is not None:
+                payload[k] = v
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return _json_logging.dumps(payload, ensure_ascii=False, default=str)
+
+
+class _TextFormatter(logging.Formatter):
+    """Formato human-friendly mantendo request_id + user visíveis."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rid = getattr(record, "request_id", "-")
+        user = getattr(record, "user_login", "-")
+        msg = record.getMessage()
+        if record.exc_info:
+            msg = f"{msg}\n{self.formatException(record.exc_info)}"
+        return f"{ts} {record.levelname:5s} req={rid} user={user}  {msg}"
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JsonFormatter() if LOG_JSON else _TextFormatter())
+    handler.addFilter(_ContextFilter())
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_setup_logging()
 log = logging.getLogger("api")
 
 # ── VERSÃO ─────────────────────────────────────────────────────────────────────
@@ -214,6 +304,52 @@ def _load_users_db() -> list[User]:
     ]
 
 
+# ── RATE LIMIT — /auth/login ────────────────────────────────────────────────
+# Estrutura simples em memória: dict[ip, list[timestamp]]. Janela deslizante.
+# Protegido por threading.Lock (GIL-friendly, sem custo perceptível).
+# Sem dependência externa. Para multi-instance, trocar por Redis no futuro.
+
+_login_attempts: dict[str, list[float]] = {}
+_login_attempts_lock = _threading.Lock()
+
+
+def _client_ip(request) -> str:
+    """Extrai IP real considerando proxy reverso (Railway / Render setam X-Forwarded-For)."""
+    fwd = (request.headers.get("x-forwarded-for") or "").strip()
+    if fwd:
+        # Pode ser CSV de IPs (proxy chain); o primeiro é o cliente original.
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_rate_check(ip: str) -> tuple[bool, int]:
+    """
+    Retorna (allowed, retry_after_seconds).
+    allowed=False quando IP atingiu RATE_LIMIT_LOGIN_ATTEMPTS na janela atual.
+    Definir RATE_LIMIT_LOGIN_ATTEMPTS=0 ou WINDOW=0 desliga o rate-limit.
+    """
+    if RATE_LIMIT_LOGIN_ATTEMPTS <= 0 or RATE_LIMIT_LOGIN_WINDOW <= 0:
+        return True, 0
+    now = time.time()
+    window_start = now - RATE_LIMIT_LOGIN_WINDOW
+    with _login_attempts_lock:
+        attempts = [t for t in _login_attempts.get(ip, []) if t > window_start]
+        if len(attempts) >= RATE_LIMIT_LOGIN_ATTEMPTS:
+            oldest = attempts[0]
+            retry_after = max(1, int(oldest + RATE_LIMIT_LOGIN_WINDOW - now) + 1)
+            _login_attempts[ip] = attempts
+            return False, retry_after
+        attempts.append(now)
+        _login_attempts[ip] = attempts
+        return True, 0
+
+
+def _login_rate_clear(ip: str) -> None:
+    """Limpa contagem após login bem-sucedido (não pune usuário legítimo)."""
+    with _login_attempts_lock:
+        _login_attempts.pop(ip, None)
+
+
 def _hash(plain: str) -> str:
     return _bcrypt.hashpw(plain.encode(), _bcrypt.gensalt()).decode()
 
@@ -248,6 +384,9 @@ async def _get_current_user(
         raise HTTPException(401, "Usuário não encontrado")
     if not user.ativo:
         raise HTTPException(401, "Usuário desativado. Contate o administrador.")
+    # Popula contextvars para os logs subsequentes desta request.
+    _user_login_ctx.set(user.login)
+    _user_role_ctx.set(user.role)
     return user
 
 
@@ -748,7 +887,19 @@ async def refresh_all():
     for tmp in filter(None, [fin_tmp, op_tmp]):
         shutil.rmtree(tmp, ignore_errors=True)
 
-    log.info(f"[perf][refresh] TOTAL refresh_all: {time.perf_counter()-_t_total:.2f}s")
+    _refresh_elapsed = round((time.perf_counter() - _t_total) * 1000, 1)
+    log.info(f"[perf][refresh] TOTAL refresh_all: {_refresh_elapsed/1000:.2f}s",
+             extra={"event": "refresh_all_done", "duration_ms": _refresh_elapsed})
+
+    # Snapshot temporal do SLA. Roda fora do lock (já liberou acima); custo ~1-3s.
+    # Dedup interno via SNAPSHOT_MIN_INTERVAL_S evita arquivos inflados.
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, _take_sla_snapshot, _refresh_elapsed, False
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[snapshot] erro pós-refresh_all: {exc}",
+                  extra={"event": "snapshot_error", "erro": str(exc)[:200]})
 
 
 async def refresh_tipo(tipo: str):
@@ -953,7 +1104,10 @@ async def merge_incremental(tipo: str, key: str, src_path: Path):
     log.info(f"[perf] merge_incremental  {tipo}/{key} "
              f"(novas={rows_novas}, atualizadas={rows_atualizadas}, total_cache={rows_total}): "
              f"{time.perf_counter()-_t:.2f}s")
-    log.info(f"[perf] merge_incremental TOTAL  {tipo}/{key}: {time.perf_counter()-_t_total:.2f}s")
+    _merge_elapsed = round((time.perf_counter() - _t_total) * 1000, 1)
+    log.info(f"[perf] merge_incremental TOTAL  {tipo}/{key}: {_merge_elapsed/1000:.2f}s",
+             extra={"event": "merge_incremental_done", "tipo": tipo, "key": key,
+                    "duration_ms": _merge_elapsed})
 
 
 async def _background_refresh():
@@ -973,6 +1127,53 @@ app.add_middleware(
 )
 
 
+# Rotas onde NÃO logamos a chamada (evita poluição em healthchecks).
+_HTTP_LOG_SKIP = {"/healthz", "/readyz"}
+
+
+@app.middleware("http")
+async def request_context_middleware(request, call_next):
+    """
+    Para cada requisição:
+      - lê X-Request-ID (ou gera um novo)
+      - registra contextvars (request_id + user vazios)
+      - mede tempo de resposta
+      - loga 1 linha estruturada com {método, rota, status, duração}
+      - devolve X-Request-ID na response
+    Não toca em body — não há risco de logar dados sensíveis.
+    """
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    token_rid = _request_id_ctx.set(rid)
+    token_user = _user_login_ctx.set("-")
+    token_role = _user_role_ctx.set("-")
+    _t0 = time.perf_counter()
+    response = None
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed = round((time.perf_counter() - _t0) * 1000, 1)
+        path = request.url.path
+        if path not in _HTTP_LOG_SKIP:
+            log.info(
+                f"{request.method} {path} {status_code} ({elapsed}ms)",
+                extra={
+                    "event": "http_request",
+                    "method": request.method,
+                    "route": path,
+                    "status_code": status_code,
+                    "duration_ms": elapsed,
+                },
+            )
+        if response is not None:
+            response.headers["X-Request-ID"] = rid
+        _request_id_ctx.reset(token_rid)
+        _user_login_ctx.reset(token_user)
+        _user_role_ctx.reset(token_role)
+
+
 @app.on_event("startup")
 async def startup():
     global users_lock, _cache_lock, APP_VERSION, _dashboard_html
@@ -990,6 +1191,7 @@ async def startup():
     # Cria apenas as duas pastas necessárias
     FIN_DIR.mkdir(parents=True, exist_ok=True)
     OP_DIR.mkdir(parents=True, exist_ok=True)
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
     log.info(f"[startup] Pastas: {FIN_DIR} | {OP_DIR}")
 
     # Inicializa banco SQLite e carrega usuários persistidos
@@ -1016,13 +1218,195 @@ async def startup():
     log.info("[startup] Concluído")
     asyncio.create_task(_background_refresh())
 
-# ── ROTAS PÚBLICAS ─────────────────────────────────────────────────────────────
-
 _NO_CACHE = {
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma":        "no-cache",
     "Expires":       "0",
 }
+
+# ── HEALTH ENDPOINTS ───────────────────────────────────────────────────────────
+# Princípios:
+#   - /healthz e /readyz são públicos (probes não autenticam).
+#   - Nenhum endpoint dispara refresh_all (read-only sobre o cache).
+#   - /health/sla é autenticado (números operacionais).
+#   - Funções helper retornam dicts puros: facilita testes sem subir servidor.
+
+
+def _healthz_payload() -> dict:
+    """Liveness: processo está vivo e respondendo. Mínimo possível."""
+    return {
+        "status": "ok",
+        "version": APP_VERSION or "unknown",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _readyz_payload() -> tuple[dict, bool]:
+    """Readiness: pronto para servir tráfego. Retorna (payload, ok).
+    ok=False → caller deve responder 503.
+    """
+    checks: dict[str, object] = {}
+
+    # 1) Startup completou? (refresh_all gravou _cache populado)
+    cache_loaded = any(
+        (_cache.get("operacional", {}).get(k) or {}).get("dados")
+        for k in OPS
+    )
+    checks["startup_completo"] = bool(APP_VERSION)
+    checks["cache_loaded"] = cache_loaded
+
+    # 2) Quais ops têm dados de fato carregados
+    ops_com_dados = [
+        k for k in OPS
+        if ((_cache.get("operacional", {}).get(k) or {}).get("linhas") or 0) > 0
+    ]
+    checks["operacoes_com_dados"] = ops_com_dados
+
+    # 3) users.db acessível? Query trivial.
+    try:
+        with _db() as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks["users_db_acessivel"] = True
+    except Exception as exc:  # noqa: BLE001
+        checks["users_db_acessivel"] = False
+        checks["users_db_erro"] = str(exc)[:200]
+
+    # 4) /data acessível?
+    checks["data_dir"] = str(_DATA_ROOT)
+    checks["data_dir_acessivel"] = _DATA_ROOT.exists() and OP_DIR.exists()
+
+    ok = (
+        checks["startup_completo"]
+        and checks["cache_loaded"]
+        and checks["users_db_acessivel"]
+        and checks["data_dir_acessivel"]
+    )
+
+    return {
+        "status": "ok" if ok else "not_ready",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "checks": checks,
+    }, ok
+
+
+def _cache_age_info() -> dict:
+    """Mais recente `atualizado` entre as ops operacionais + idade em segundos."""
+    latest: datetime | None = None
+    ops_info = []
+    for key in OPS:
+        e = _cache.get("operacional", {}).get(key) or {}
+        atualizado = e.get("atualizado")
+        ops_info.append({
+            "key": key,
+            "linhas": e.get("linhas", 0),
+            "arquivo": e.get("arquivo"),
+            "atualizado": atualizado,
+            "erro": e.get("erro"),
+        })
+        if atualizado:
+            try:
+                dt = datetime.strptime(atualizado, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if latest is None or dt > latest:
+                    latest = dt
+            except ValueError:
+                pass
+    if latest is None:
+        return {"ultima_atualizacao": None, "idade_cache_segundos": None, "operacoes": ops_info}
+    age = int((datetime.now(timezone.utc) - latest).total_seconds())
+    return {
+        "ultima_atualizacao": latest.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "idade_cache_segundos": age,
+        "operacoes": ops_info,
+    }
+
+
+def _classify_sla_status(sla_pct: float, idade_segundos: int | None,
+                         inconsistencias: int, total_sla: int) -> str:
+    """Regras de severidade do /health/sla."""
+    if total_sla == 0:
+        return "critical"  # sem dados = não consegue auditar
+    if inconsistencias > 0:
+        return "critical"
+    if idade_segundos is not None and idade_segundos > 3600:
+        return "critical"
+    if sla_pct < 85:
+        return "critical"
+    if idade_segundos is not None and idade_segundos > 1800:
+        return "warning"
+    if sla_pct < 95:
+        return "warning"
+    return "ok"
+
+
+def _health_sla_payload() -> dict:
+    """Resumo SLA + idade do cache + status (ok/warning/critical).
+    Reaproveita _diag_audit (sem detalhes) — mesma regra do painel."""
+    audit = _diag_audit(op_filter=None, codigos_filter=None, include_detalhes=False)
+    cache_info = _cache_age_info()
+    status = _classify_sla_status(
+        sla_pct=audit["resumo"]["sla_percentual"],
+        idade_segundos=cache_info["idade_cache_segundos"],
+        inconsistencias=audit["auditoria"]["inconsistencias"],
+        total_sla=audit["resumo"]["total_sla"],
+    )
+    return {
+        "status": status,
+        "version": APP_VERSION or "unknown",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sla": {
+            **audit["resumo"],
+            "inconsistencias": audit["auditoria"]["inconsistencias"],
+        },
+        "cache": cache_info,
+    }
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe — sem auth."""
+    return _healthz_payload()
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe — sem auth. Retorna 503 se não pronto."""
+    payload, ok = _readyz_payload()
+    if not ok:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+@app.get("/health/sla")
+async def health_sla(admin: User = Depends(_require_gestor)):
+    """Saúde operacional do SLA (resumo + cache age + status)."""
+    loop = asyncio.get_event_loop()
+    async with _cache_lock:
+        # Acessa _cache dentro do lock; computação fora.
+        cache_snap = {
+            "operacional": {
+                k: {"dados": list((_cache.get("operacional", {}).get(k) or {}).get("dados") or []),
+                    "linhas": (_cache.get("operacional", {}).get(k) or {}).get("linhas", 0),
+                    "arquivo": (_cache.get("operacional", {}).get(k) or {}).get("arquivo"),
+                    "atualizado": (_cache.get("operacional", {}).get(k) or {}).get("atualizado"),
+                    "erro": (_cache.get("operacional", {}).get(k) or {}).get("erro")}
+                for k in OPS
+            },
+            "financeiro": {},
+        }
+
+    def _run():
+        global _cache
+        saved = _cache
+        try:
+            _cache = cache_snap
+            return _health_sla_payload()
+        finally:
+            _cache = saved
+
+    return await loop.run_in_executor(None, _run)
+
+
+# ── ROTAS PÚBLICAS ─────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -1038,11 +1422,47 @@ async def root():
 # ── AUTH ───────────────────────────────────────────────────────────────────────
 
 @app.post("/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    ip = _client_ip(request)
+    # 1) Rate-limit primeiro: bloqueia antes mesmo de tocar no SQLite/bcrypt.
+    allowed, retry_after = _login_rate_check(ip)
+    if not allowed:
+        log.warning(
+            f"[auth] rate-limit bloqueou IP {ip} (login tentado: '{req.login}')",
+            extra={"event": "login_rate_limited", "operacao": req.login,
+                   "ip": ip, "retry_after_s": retry_after},
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limited",
+                "message": f"Muitas tentativas de login. Tente novamente em {retry_after} segundos.",
+                "retry_after_s": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # 2) Verifica credenciais
     async with users_lock:
         user = next((u for u in users_db.values() if u.login.lower() == req.login.lower()), None)
     if not user or not _verify(req.password.strip(), user.password_hash):
+        # Atraso pequeno e aleatório dificulta brute-force (timing attacks
+        # e enumeração de usuários valid os).
+        await asyncio.sleep(0.3 + _random.random() * 0.2)
+        log.warning(
+            f"[auth] login falhou para '{req.login}' (IP {ip})",
+            extra={"event": "login_failed", "operacao": req.login, "ip": ip},
+        )
         raise HTTPException(401, "Login ou senha inválidos")
+
+    # 3) Sucesso: limpa o contador desse IP, popula contextvars, loga e devolve token.
+    _login_rate_clear(ip)
+    _user_login_ctx.set(user.login)
+    _user_role_ctx.set(user.role)
+    log.info(
+        f"[auth] login ok ({user.role}) IP {ip}",
+        extra={"event": "login_success", "ip": ip},
+    )
     return {
         "access_token":        _create_token(user),
         "token_type":          "bearer",
@@ -1297,16 +1717,42 @@ def _diag_build_dashrows(op_filter: str | None) -> tuple[dict[str, dict], dict[s
     return dash_by_code, op_of_code
 
 
-def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
+_VALID_CATEGORIAS = {"VENCIDAS", "VENCEM_HOJE", "ENTREGUES_SLA", "CUSTODIA_SLA", "FORA_SLA"}
+
+
+def _diag_audit(
+    op_filter: str | None,
+    codigos_filter: set[str] | None,
+    *,
+    include_detalhes: bool = False,
+    categoria_filter: str | None = None,
+    apenas_inconsistencias: bool = False,
+    apenas_excluidas_10h: bool = False,
+    limit: int = 0,
+    offset: int = 0,
+) -> dict:
     """
-    Auditoria completa do painel SLA + validação da regra das 10h.
-    Reproduz: parseOp + dedup + calcM + entraNoSlaHoje.
+    Auditoria do painel SLA + validação da regra das 10h.
+
+    Por padrão retorna só resumo + auditoria (response leve).
+    `include_detalhes=True` adiciona a lista `detalhes` (response grande).
+
+    Filtros aplicados na lista `detalhes` (não no resumo):
+      categoria_filter        — VENCIDAS / VENCEM_HOJE / ENTREGUES_SLA / CUSTODIA_SLA / FORA_SLA
+      apenas_inconsistencias  — só remessas que violam estritamente a regra 10h
+      apenas_excluidas_10h    — só remessas excluídas pela regra
+      limit / offset          — paginação
     """
+    _t0 = time.perf_counter()
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     dash_by_code, op_of_code = _diag_build_dashrows(op_filter)
+    _t1 = time.perf_counter()
 
     if codigos_filter:
         dash_by_code = {c: r for c, r in dash_by_code.items() if c in codigos_filter}
+
+    if categoria_filter and categoria_filter not in _VALID_CATEGORIAS:
+        categoria_filter = None  # ignora silenciosamente valor inválido
 
     counts = {"vencidas": 0, "vencem_hoje": 0, "entregues_sla": 0, "custodia_sla": 0,
               "excluidas_10h": 0, "fora_sla": 0}
@@ -1337,7 +1783,6 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             counts["fora_sla"] += 1
 
         # Validação ESTRITA: pacote no SLA cuja primeira entrada conhecida é hoje >=10h.
-        # PE_real hoje >=10h ou Status=ENTRADA atual hoje >=10h → viola a regra (bug).
         tipo_inc = None
         suspeita = None
         if buckets:
@@ -1348,15 +1793,11 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             de       = _parse_dt_evento(dt_str)
             de_day   = de.replace(hour=0, minute=0, second=0, microsecond=0) if de else None
 
-            # Estrita: PE real (não proxy) hoje >=10h, ou Status=ENTRADA hoje >=10h.
             if pe_d and not pe_proxy and pe_day == today and pe_d.hour >= 10:
                 tipo_inc = f"PE_real hoje {pe_d:%H:%M} >=10h no SLA"
             elif status == "ENTRADA" and de and de_day == today and de.hour >= 10:
                 tipo_inc = f"Status=ENTRADA hoje {de:%H:%M} >=10h no SLA"
 
-            # Suspeita (auditoria visual): no SLA com DtEvento hoje>=10h E PE proxy
-            # apontando antes de hoje. Pós-fix de Hist deve ser sempre legítimo
-            # (pacote estava na torre antes), mas listamos para conferência manual.
             if not tipo_inc and pe_proxy and pe_d and pe_day < today \
                     and de and de_day == today and de.hour >= 10:
                 suspeita = f"PE_proxy={pe_str[:10]} (estava na torre antes), DtEvento hoje {de:%H:%M}"
@@ -1371,6 +1812,20 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
                               "status": status, "dt_evento": dt_str,
                               "primeira_entrada": str(r.get("__primeira_entrada", "")),
                               "categoria_sla": ",".join(buckets)})
+
+        # detalhes só são montados se realmente vão ser usados (economia de memória).
+        if not include_detalhes:
+            continue
+
+        # Filtros sobre a lista `detalhes`:
+        if apenas_inconsistencias and not tipo_inc:
+            continue
+        if apenas_excluidas_10h and entra:
+            continue
+        if categoria_filter:
+            cat_atual = buckets[0] if buckets else "FORA_SLA"
+            if categoria_filter != cat_atual and categoria_filter not in buckets:
+                continue
 
         rota = (str(r.get("Rota", "")).strip()
                 or str(r.get("Hist. ultimo operador", "")).strip()
@@ -1387,19 +1842,43 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             "pe_proxy": bool(r.get("__pe_proxy", False)),
             "rota_entregador": rota,
             "entrou_no_sla": bool(buckets),
-            "categoria_sla": ",".join(buckets) if buckets else "—",
+            "categoria_sla": ",".join(buckets) if buckets else "FORA_SLA",
             "motivo": motivo,
             "inconsistente": bool(tipo_inc),
             "tipo_inconsistencia": tipo_inc,
         })
 
+    _t2 = time.perf_counter()
+    total_detalhes = len(detalhes)
+    # Paginação aplicada por último (sobre detalhes já filtrados).
+    if include_detalhes and (offset or limit):
+        end = (offset + limit) if limit > 0 else None
+        detalhes = detalhes[offset:end]
+
     den = counts["entregues_sla"] + counts["vencidas"] + counts["vencem_hoje"]
     sla_pct = round(counts["entregues_sla"] / den * 100, 2) if den else 100.0
+
+    cache_info = _cache_age_info()
+    elapsed = round(time.perf_counter() - _t0, 3)
+    log.info(
+        f"[diag/audit] op={op_filter} dash={len(dash_by_code)} "
+        f"build={_t1-_t0:.2f}s classify={_t2-_t1:.2f}s total={elapsed:.2f}s "
+        f"detalhes_filtrados={total_detalhes} retornados={len(detalhes)}"
+    )
 
     return {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "today": today.strftime("%Y-%m-%d"),
-        "filtros": {"operacao": op_filter, "codigos": sorted(codigos_filter) if codigos_filter else None},
+        "filtros": {
+            "operacao": op_filter,
+            "codigos": sorted(codigos_filter) if codigos_filter else None,
+            "categoria": categoria_filter,
+            "apenas_inconsistencias": apenas_inconsistencias,
+            "apenas_excluidas_10h": apenas_excluidas_10h,
+            "include_detalhes": include_detalhes,
+            "limit": limit,
+            "offset": offset,
+        },
         "resumo": {
             "dashboard_total": len(dash_by_code),
             "total_sla": counts["vencidas"] + counts["vencem_hoje"] + counts["entregues_sla"] + counts["custodia_sla"],
@@ -1416,14 +1895,19 @@ def _diag_audit(op_filter: str | None, codigos_filter: set[str] | None) -> dict:
             "inconsistencias_detalhe": inconsistencias[:100],
             "remessas_suspeitas": len(suspeitas),
             "remessas_suspeitas_detalhe": suspeitas[:100],
+            "ultima_atualizacao_cache": cache_info.get("ultima_atualizacao"),
+            "idade_cache_segundos": cache_info.get("idade_cache_segundos"),
         },
+        "detalhes_total_filtrado": total_detalhes,
         "detalhes": detalhes,
+        "tempo_processamento_s": elapsed,
     }
 
 
 def _diag_audit_to_csv(payload: dict) -> str:
     """Serializa detalhes da auditoria em CSV (delimitador ;)."""
-    import io as _io, csv as _csv
+    import csv as _csv
+    import io as _io
     buf = _io.StringIO()
     w = _csv.writer(buf, delimiter=";", quoting=_csv.QUOTE_MINIMAL)
     w.writerow(["Codigo","Operacao","Status","DtEvento","Previsao","dDiff",
@@ -1443,26 +1927,82 @@ async def diag_sla(
     mode: str | None = None,
     op: str | None = None,
     export: str | None = None,
+    details: int | None = None,
+    categoria: str | None = None,
+    apenas_inconsistencias: str | None = None,
+    apenas_excluidas_10h: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
     admin: User = Depends(_require_gestor),
 ):
     """
     Diagnóstico SLA.
 
     Modos:
-      mode=audit         → auditoria completa do painel + inconsistências da regra 10h
+      mode=audit         → auditoria do painel + inconsistências da regra 10h
       (sem mode)         → legado: diagnóstico por código (codigos=A,B,C obrigatório)
 
     Filtros (modo audit):
       op=gv|itabira|jm|curvelo   → restringe a uma operação
       codigos=A,B,C              → restringe a códigos específicos
-      export=csv                 → retorna CSV em vez de JSON
+      details=1                  → inclui lista 'detalhes' (response grande)
+      categoria=VENCIDAS|VENCEM_HOJE|ENTREGUES_SLA|CUSTODIA_SLA|FORA_SLA
+      apenas_inconsistencias=true → só remessas que violam estritamente a regra
+      apenas_excluidas_10h=true   → só remessas excluídas pela regra 10h
+      limit=100                  → trunca detalhes
+      offset=0                   → paginação
+      export=csv                 → força details=1 e retorna CSV
     """
     if mode == "audit":
         cset = {c.strip() for c in codigos.split(",") if c.strip()} if codigos else None
         op_key = op if (op and op in OPS) else None
+        want_csv = (export == "csv")
+        want_det = bool(details) or want_csv
+        det_limit = max(int(limit), 0) if limit else 0
+        det_offset = max(int(offset), 0) if offset else 0
+        cat_filter = categoria.upper().strip() if categoria else None
+        only_inc = str(apenas_inconsistencias or "").lower() in ("1", "true", "yes", "sim")
+        only_excl = str(apenas_excluidas_10h or "").lower() in ("1", "true", "yes", "sim")
+
+        # Snapshot rápido do cache sob lock; processamento pesado fora do lock
+        # e em thread executor — não bloqueia o event loop.
         async with _cache_lock:
-            payload = _diag_audit(op_filter=op_key, codigos_filter=cset)
-        if export == "csv":
+            cache_snap = {
+                "operacional": {
+                    k: {
+                        "dados": list((_cache.get("operacional", {}).get(k) or {}).get("dados") or []),
+                        "atualizado": (_cache.get("operacional", {}).get(k) or {}).get("atualizado"),
+                        "linhas": (_cache.get("operacional", {}).get(k) or {}).get("linhas", 0),
+                        "arquivo": (_cache.get("operacional", {}).get(k) or {}).get("arquivo"),
+                        "erro": (_cache.get("operacional", {}).get(k) or {}).get("erro"),
+                    }
+                    for k in OPS
+                },
+                "financeiro": {},
+            }
+
+        def _run():
+            global _cache
+            saved = _cache
+            try:
+                _cache = cache_snap
+                return _diag_audit(
+                    op_filter=op_key,
+                    codigos_filter=cset,
+                    include_detalhes=want_det,
+                    categoria_filter=cat_filter,
+                    apenas_inconsistencias=only_inc,
+                    apenas_excluidas_10h=only_excl,
+                    limit=det_limit,
+                    offset=det_offset,
+                )
+            finally:
+                _cache = saved
+
+        loop = asyncio.get_event_loop()
+        payload = await loop.run_in_executor(None, _run)
+
+        if want_csv:
             from fastapi.responses import PlainTextResponse
             csv_text = _diag_audit_to_csv(payload)
             fname = f"diag_sla_audit_{payload['today']}.csv"
@@ -1505,7 +2045,8 @@ async def diag_sla(
 
 async def _do_rebuild_cache(admin_login: str) -> dict:
     """Rebuild completo do _cache lendo tudo do disco. Bloqueia uploads concorrentes."""
-    log.info(f"[admin] {admin_login} → rebuild-cache iniciado")
+    log.info(f"[admin] {admin_login} → rebuild-cache iniciado",
+             extra={"event": "rebuild_cache_started"})
     _t = time.perf_counter()
     await refresh_all()
     elapsed = time.perf_counter() - _t
@@ -1520,7 +2061,8 @@ async def _do_rebuild_cache(admin_login: str) -> dict:
                     "linhas": e.get("linhas", 0),
                     "atualizado": e.get("atualizado"), "erro": e.get("erro"),
                 })
-    log.info(f"[admin] rebuild-cache concluído em {elapsed:.2f}s")
+    log.info(f"[admin] rebuild-cache concluído em {elapsed:.2f}s",
+             extra={"event": "rebuild_cache_done", "duration_ms": round(elapsed*1000, 1)})
     return {
         "ok": True,
         "elapsed_seconds": round(elapsed, 2),
@@ -1540,6 +2082,339 @@ async def admin_rebuild_cache_post(admin: User = Depends(_require_admin)):
 async def admin_rebuild_cache_get(admin: User = Depends(_require_admin)):
     """Alias GET de POST /admin/rebuild-cache (facilita chamada manual via browser)."""
     return await _do_rebuild_cache(admin.login)
+
+
+# ── AUDITORIA VISUAL SLA (DIRETOR) ─────────────────────────────────────────────
+# Endpoint dedicado para a tela "Auditoria SLA". Reaproveita _diag_audit (P5)
+# em executor e adiciona pós-filtros operacionais (status, entra_no_sla,
+# apenas_suspeitas). Nunca altera o painel SLA principal.
+
+_VALID_STATUS = {"ENTREGUE", "ENTREGUE NO PICKUP", "EM ROTA", "EM ROTA PICKUP",
+                 "ENTRADA", "CUSTODIA", "TRAVADO", "TRANSFERENCIA", "EMISSAO"}
+
+
+def _parse_bool(s: str | None) -> bool | None:
+    """Retorna True/False/None de uma string flexível ('true', '1', 'sim', etc.)."""
+    if s is None:
+        return None
+    v = str(s).strip().lower()
+    if v in ("true", "1", "yes", "sim", "y", "s"):
+        return True
+    if v in ("false", "0", "no", "nao", "não", "n"):
+        return False
+    return None
+
+
+@app.get("/audit/sla")
+async def audit_sla(
+    op: str | None = None,
+    codigos: str | None = None,
+    categoria: str | None = None,
+    status: str | None = None,
+    entra_no_sla: str | None = None,
+    apenas_inconsistencias: str | None = None,
+    apenas_suspeitas: str | None = None,
+    apenas_fallback: str | None = None,
+    limit: int | None = 200,
+    offset: int | None = 0,
+    admin: User = Depends(_require_admin),
+):
+    """
+    Auditoria visual SLA — DIRETOR only.
+
+    Reaproveita /diag/sla?mode=audit (mesma regra), e adiciona:
+      - status:                filtra por Status atual (EM ROTA, ENTREGUE, etc.)
+      - entra_no_sla=true|false: só remessas que entram ou não no SLA
+      - apenas_suspeitas:      só remessas marcadas como suspeitas (PE proxy
+                               apontando dia anterior com DtEvento hoje >=10h)
+      - apenas_fallback:       só remessas com PE proxy ou sem candidato
+      - limit/offset:          paginação (default limit=200)
+
+    Resposta:
+      resumo, auditoria (com idade_cache), filtros aplicados,
+      detalhes_total_filtrado, detalhes (paginados).
+    """
+    cset = {c.strip() for c in codigos.split(",") if c.strip()} if codigos else None
+    op_key = op if (op and op in OPS) else None
+    cat_filter = categoria.upper().strip() if categoria else None
+    only_inc = bool(_parse_bool(apenas_inconsistencias))
+    only_susp = bool(_parse_bool(apenas_suspeitas))
+    only_fb = bool(_parse_bool(apenas_fallback))
+    entra_filter = _parse_bool(entra_no_sla)
+    status_filter = status.upper().strip() if status else None
+    if status_filter and status_filter not in _VALID_STATUS:
+        status_filter = None
+    lim = max(int(limit), 0) if limit else 0
+    off = max(int(offset), 0) if offset else 0
+
+    # Snapshot rápido sob lock; processamento fora.
+    async with _cache_lock:
+        cache_snap = {
+            "operacional": {
+                k: {
+                    "dados": list((_cache.get("operacional", {}).get(k) or {}).get("dados") or []),
+                    "atualizado": (_cache.get("operacional", {}).get(k) or {}).get("atualizado"),
+                    "linhas": (_cache.get("operacional", {}).get(k) or {}).get("linhas", 0),
+                    "arquivo": (_cache.get("operacional", {}).get(k) or {}).get("arquivo"),
+                    "erro": (_cache.get("operacional", {}).get(k) or {}).get("erro"),
+                }
+                for k in OPS
+            },
+            "financeiro": {},
+        }
+
+    def _run():
+        global _cache
+        saved = _cache
+        try:
+            _cache = cache_snap
+            # 1) Roda a auditoria completa com detalhes (sem paginar ainda).
+            payload = _diag_audit(
+                op_filter=op_key,
+                codigos_filter=cset,
+                include_detalhes=True,
+                categoria_filter=cat_filter,
+                apenas_inconsistencias=only_inc,
+                apenas_excluidas_10h=False,
+                limit=0, offset=0,
+            )
+            detalhes = payload["detalhes"]
+
+            # 2) Pós-filtros adicionais (não impactam resumo/auditoria).
+            if status_filter:
+                detalhes = [d for d in detalhes if d["status_atual"] == status_filter]
+            if entra_filter is not None:
+                detalhes = [d for d in detalhes if d["entrou_no_sla"] == entra_filter]
+            if only_susp:
+                susp_codes = {s["codigo"] for s in payload["auditoria"]["remessas_suspeitas_detalhe"]}
+                detalhes = [d for d in detalhes if d["codigo"] in susp_codes]
+            if only_fb:
+                detalhes = [d for d in detalhes
+                            if d["pe_proxy"] or "sem candidato" in (d.get("motivo") or "")
+                            or "não parsearam" in (d.get("motivo") or "")]
+
+            # 3) Anota a "cor" sugerida para o frontend (cálculo centralizado aqui).
+            for d in detalhes:
+                d["badge"] = _audit_badge(d)
+
+            # 4) Paginação.
+            total_after_filters = len(detalhes)
+            end = (off + lim) if lim > 0 else None
+            detalhes = detalhes[off:end]
+
+            payload["detalhes"] = detalhes
+            payload["detalhes_total_filtrado"] = total_after_filters
+            payload["filtros"] = {
+                **payload["filtros"],
+                "status": status_filter,
+                "entra_no_sla": entra_filter,
+                "apenas_suspeitas": only_susp,
+                "apenas_fallback": only_fb,
+                "limit": lim, "offset": off,
+            }
+            return payload
+        finally:
+            _cache = saved
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run)
+
+
+def _audit_badge(d: dict) -> str:
+    """Cor sugerida para a UI da auditoria visual.
+    Ordem de precedência: red > yellow > green > gray."""
+    if d.get("inconsistente"):
+        return "red"
+    motivo = (d.get("motivo") or "").lower()
+    is_fallback = bool(d.get("pe_proxy")) or "sem candidato" in motivo or "não parsearam" in motivo
+    if is_fallback:
+        return "yellow"
+    if d.get("entrou_no_sla"):
+        return "green"
+    return "gray"
+
+
+# ── SNAPSHOTS TEMPORAIS DO SLA ──────────────────────────────────────────────
+# Persistência: JSONL diário em {DATA_ROOT}/dados/snapshots/sla-YYYY-MM-DD.jsonl
+# Cada linha = 1 snapshot ~600 bytes. Dedup por intervalo mínimo.
+# Retenção: arquivos com data > SNAPSHOT_RETENTION_DAYS são apagados.
+
+_last_snapshot_at: float = 0.0
+_snapshot_lock = _threading.Lock()
+
+
+def _snapshot_op_summary(op_filter: str | None) -> dict:
+    """Roda _diag_audit (sem detalhes) para uma operação ou global."""
+    payload = _diag_audit(op_filter=op_filter, codigos_filter=None,
+                           include_detalhes=False)
+    r = payload["resumo"]
+    a = payload["auditoria"]
+    return {
+        "total_sla": r["total_sla"],
+        "vencidas": r["vencidas"],
+        "vencem_hoje": r["vencem_hoje"],
+        "entregues_sla": r["entregues_sla"],
+        "custodia_sla": r["custodia_sla"],
+        "faltam": r["faltam"],
+        "sla_percentual": r["sla_percentual"],
+        "inconsistencias": a["inconsistencias"],
+        "remessas_suspeitas": a["remessas_suspeitas"],
+    }
+
+
+def _take_sla_snapshot(duration_refresh_ms: float | None = None,
+                       force: bool = False) -> dict | None:
+    """
+    Gera 1 snapshot do estado atual do SLA e grava em
+    {SNAP_DIR}/sla-YYYY-MM-DD.jsonl.
+    Retorna o snapshot salvo, ou None se foi pulado por dedup/disabled.
+    """
+    if not SNAPSHOT_ENABLED:
+        return None
+
+    global _last_snapshot_at
+    now = time.time()
+    with _snapshot_lock:
+        if not force and SNAPSHOT_MIN_INTERVAL_S > 0:
+            elapsed = now - _last_snapshot_at
+            if elapsed < SNAPSHOT_MIN_INTERVAL_S:
+                log.info(f"[snapshot] pulado (último há {elapsed:.0f}s, min={SNAPSHOT_MIN_INTERVAL_S}s)",
+                         extra={"event": "snapshot_skipped"})
+                return None
+
+        try:
+            cache_info = _cache_age_info()
+            snap = {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "version": APP_VERSION or "unknown",
+                "duration_refresh_ms": duration_refresh_ms,
+                "cache_age_s": cache_info.get("idade_cache_segundos"),
+                "global": _snapshot_op_summary(None),
+                "por_operacao": {
+                    k: _snapshot_op_summary(k) for k in OPS
+                },
+            }
+            SNAP_DIR.mkdir(parents=True, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = SNAP_DIR / f"sla-{today}.jsonl"
+            with path.open("a", encoding="utf-8") as fp:
+                fp.write(_json_logging.dumps(snap, ensure_ascii=False) + "\n")
+            _last_snapshot_at = now
+            log.info(f"[snapshot] salvo em {path.name} (SLA={snap['global']['sla_percentual']}%)",
+                     extra={"event": "snapshot_saved",
+                            "arquivo": path.name})
+            _cleanup_old_snapshots()
+            return snap
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[snapshot] falhou: {exc}",
+                      extra={"event": "snapshot_error", "erro": str(exc)[:200]})
+            return None
+
+
+def _cleanup_old_snapshots() -> int:
+    """Apaga arquivos sla-YYYY-MM-DD.jsonl com data > SNAPSHOT_RETENTION_DAYS.
+    Retorna a quantidade de arquivos apagados."""
+    if SNAPSHOT_RETENTION_DAYS <= 0 or not SNAP_DIR.exists():
+        return 0
+    cutoff = (datetime.now(timezone.utc) -
+              timedelta(days=SNAPSHOT_RETENTION_DAYS)).date()
+    removed = 0
+    for fp in SNAP_DIR.glob("sla-*.jsonl"):
+        try:
+            date_str = fp.stem.replace("sla-", "")
+            file_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                fp.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log.info(f"[snapshot] limpeza removeu {removed} arquivo(s) antigo(s)",
+                 extra={"event": "snapshot_cleanup", "linhas": removed})
+    return removed
+
+
+def _read_sla_history(date: str, op: str | None = None,
+                      interval_min: int = 0, limit: int = 1000) -> list[dict]:
+    """
+    Lê snapshots de um dia específico. Retorna lista de pontos
+    {ts, sla_percentual, total_sla, ...}.
+    `op`=None → global; `op`='gv'|... → por_operacao[op].
+    `interval_min`>0 → amostra um ponto a cada N minutos.
+    """
+    path = SNAP_DIR / f"sla-{date}.jsonl"
+    if not path.exists():
+        return []
+    points: list[dict] = []
+    last_bucket = None
+    interval_s = max(0, interval_min) * 60
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    snap = _json_logging.loads(line)
+                except (ValueError, OSError):
+                    continue
+                vals = snap.get("por_operacao", {}).get(op) if op else snap.get("global")
+                if not vals:
+                    continue
+                point = {"ts": snap.get("ts"), "cache_age_s": snap.get("cache_age_s"),
+                         "duration_refresh_ms": snap.get("duration_refresh_ms"),
+                         **vals}
+                # Amostragem por intervalo: pega apenas o primeiro de cada bucket
+                if interval_s > 0 and point.get("ts"):
+                    try:
+                        ts_dt = datetime.strptime(point["ts"], "%Y-%m-%dT%H:%M:%SZ")
+                        bucket_key = int(ts_dt.timestamp() // interval_s)
+                        if bucket_key == last_bucket:
+                            continue
+                        last_bucket = bucket_key
+                    except ValueError:
+                        pass
+                points.append(point)
+                if limit and len(points) >= limit:
+                    break
+    except OSError:
+        return []
+    return points
+
+
+@app.get("/health/sla/history")
+async def health_sla_history(
+    date: str | None = None,
+    op: str | None = None,
+    interval: int | None = None,
+    limit: int | None = 1000,
+    user: User = Depends(_get_current_user),
+):
+    """
+    Histórico de snapshots SLA.
+      date     YYYY-MM-DD (default: hoje UTC)
+      op       gv|itabira|jm|curvelo (default: global)
+      interval amostragem em minutos (default: sem amostragem)
+      limit    máximo de pontos (default: 1000)
+    """
+    if date is None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    op_key = op if (op and op in OPS) else None
+    iv = max(0, int(interval)) if interval else 0
+    lim = max(1, int(limit)) if limit else 1000
+    points = await asyncio.get_event_loop().run_in_executor(
+        None, _read_sla_history, date, op_key, iv, lim
+    )
+    return {
+        "date": date,
+        "op": op_key,
+        "interval_min": iv,
+        "count": len(points),
+        "points": points,
+    }
 
 
 @app.get("/status")
@@ -1608,7 +2483,9 @@ async def upload_file(
     _t = time.perf_counter()
     dest.write_bytes(content)
     log.info(f"[perf] save_to_disk  {file.filename} ({len(content)//1024} KB | tipo={tipo}): {time.perf_counter()-_t:.3f}s")
-    log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)")
+    log.info(f"[upload] {user.login} → dados/{tipo}/{file.filename} ({len(content)} bytes)",
+             extra={"event": "upload_started", "tipo": tipo,
+                    "arquivo": file.filename, "linhas": None})
 
     # Detecta a key do arquivo recém-salvo e atualiza só esse cache
     loop = asyncio.get_event_loop()
@@ -1622,7 +2499,11 @@ async def upload_file(
         log.warning(f"[upload] {file.filename}: key não detectada, fallback refresh_tipo completo")
         await refresh_tipo(tipo)
     log.info(f"[perf] refresh_all_TOTAL  tipo={tipo}: {time.perf_counter()-_t:.2f}s")
-    log.info(f"[perf] TOTAL_UPLOAD  {file.filename}: {time.perf_counter()-_t_upload:.2f}s")
+    _upload_elapsed = round((time.perf_counter() - _t_upload) * 1000, 1)
+    log.info(f"[perf] TOTAL_UPLOAD  {file.filename}: {_upload_elapsed/1000:.2f}s",
+             extra={"event": "upload_done", "tipo": tipo,
+                    "arquivo": file.filename, "duration_ms": _upload_elapsed,
+                    "key": detected_key})
 
     # Retorna quais operações foram identificadas na pasta
     async with _cache_lock:
