@@ -324,6 +324,11 @@ tr:hover td{background:#FFF5F5;}
 #tend-svg .sla-area{fill:#E1262E;fill-opacity:0.08;}
 #tend-svg .point{fill:#E1262E;}
 #tend-svg .meta{stroke:#22A05B;stroke-width:1;stroke-dasharray:4 4;}
+
+/* ── Tela ENTRADA: botão "Críticas" (vencidas + hoje) ───────────────── */
+.xbtn.criticas-active{background:#CC0000;color:white;border-color:#CC0000;font-weight:600;}
+.xbtn.criticas-active:hover{background:#A30000;border-color:#A30000;}
+#entrada-cnt.criticas-active{color:#CC0000;font-weight:600;}
 </style>
 </head>
 <body>
@@ -856,6 +861,7 @@ tr:hover td{background:#FFF5F5;}
               <option value="za-cidade">Z→A Cidade</option><option value="az-entr">A→Z Entregador</option>
               <option value="dias-asc">Dias ↑</option><option value="dias-desc">Dias ↓</option>
             </select>
+            <button class="xbtn" id="entrada-criticas-btn" onclick="toggleEntradaCriticas()" title="Apenas vencidas (prazo passou) + vencendo hoje">⚠ Críticas</button>
             <button class="xbtn" onclick="exportOp('entrada')">⬇ Excel</button>
           </div>
         </div>
@@ -2715,7 +2721,13 @@ function applySort(rows,az){
   return r;
 }
 
-function renderOp(type){
+// Estado do filtro "Críticas" da tela ENTRADA (vencidas + vencendo hoje).
+// Local: só afeta /page-entrada/, NUNCA o painel SLA, calcM ou outras telas.
+let _entradaCriticas = false;
+
+// Fonte única de remessas para a tabela e o export. Garante que o que está
+// na tela é exatamente o que sai para Excel.
+function _filteredOpRows(type){
   const rows=getRows();
   const stMap={rota:['EM ROTA','EM ROTA PICKUP'],cust:['CUSTODIA'],trav:['TRAVADO'],entrada:['ENTRADA']};
   let f=rows.filter(r=>stMap[type].includes(r.Status));
@@ -2728,7 +2740,16 @@ function renderOp(type){
   if(entr)f=f.filter(r=>r.Entr===entr);
   if(city)f=f.filter(r=>r.Cidade===city);
   if(dias!==''){const d=parseInt(dias);f=f.filter(r=>d===8?r.Dias>=8:r.Dias===d);}
-  f=applySort(f,az);
+  // ENTRADA: filtro "Críticas" (vencidas: Dias>0, vence hoje: Dias===0).
+  // r.Dias = dDiff(Previsao) = (hoje - previsao) em dias inteiros.
+  if(type==='entrada' && _entradaCriticas){
+    f=f.filter(r=>r.Dias!==null && r.Dias>=0);
+  }
+  return applySort(f,az);
+}
+
+function renderOp(type){
+  const f=_filteredOpRows(type);
   const tb=document.getElementById(type+'-tb');
   if(type==='rota'){
     tb.innerHTML=f.slice(0,300).map(r=>`<tr>
@@ -2748,11 +2769,27 @@ function renderOp(type){
       <td class="td-codigo" data-codigo="${r.Codigo}" onclick="openCodeHistory(this.dataset.codigo)">${r.Codigo}</td><td>${r.Cidade}</td><td>${r.Bairro}</td>
       <td>${r.Rota}</td><td>${r.DtEvento}</td><td>${r.Previsao}</td><td>${dcTrav(r)}</td></tr>`).join('');
   }
-  document.getElementById(type+'-cnt').textContent=f.length+' registros';
+  // Contador: prefixa "Críticas:" + cor vermelha quando filtro ativo na ENTRADA
+  const cnt=document.getElementById(type+'-cnt');
+  if(cnt){
+    const prefix=(type==='entrada' && _entradaCriticas) ? 'Críticas: ' : '';
+    cnt.textContent=prefix+f.length+' registros';
+    cnt.classList.toggle('criticas-active', type==='entrada' && _entradaCriticas);
+  }
 }
+
 function exportOp(type){
-  const stMap={rota:['EM ROTA','EM ROTA PICKUP'],cust:['CUSTODIA'],trav:['TRAVADO'],entrada:['ENTRADA']};
-  xlsxExport(getRows().filter(r=>stMap[type].includes(r.Status)),type);
+  // Export respeita TODOS os filtros visíveis (incluindo "Críticas" no entrada).
+  xlsxExport(_filteredOpRows(type),type);
+}
+
+// Toggle do botão "Críticas" da tela ENTRADA. Apenas dispara re-render;
+// nenhum cálculo de SLA/calcM/painel é afetado.
+function toggleEntradaCriticas(){
+  _entradaCriticas=!_entradaCriticas;
+  const btn=document.getElementById('entrada-criticas-btn');
+  if(btn)btn.classList.toggle('criticas-active', _entradaCriticas);
+  renderOp('entrada');
 }
 
 // ── DRAWER ──
