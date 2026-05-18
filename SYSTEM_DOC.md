@@ -362,6 +362,42 @@ A regra se aplica a **todos** os componentes do SLA do dia, incluindo vencidas:
 - A justificativa: a previsão já passou (sempre em atraso); o que interessa operacionalmente é há quantos dias está travada.
 - Travadas **não entram no SLA do dia** (não são pendentes elegíveis).
 
+### 3.6 Tela ENTRADA — Filtro "Críticas" (vencidas + hoje)
+
+Botão **⚠ Críticas** no painel-hdr da tela ENTRADA (`page-entrada`). Quando
+ligado, filtra a tabela para mostrar apenas remessas com prazo vencido ou
+vencendo hoje:
+
+```
+Crítica = r.Status === "ENTRADA" AND r.Dias !== null AND r.Dias >= 0
+         (Dias = dDiff(Previsao); >0 = vencida, 0 = vence hoje, <0 = futura)
+```
+
+Características:
+
+- **Cumulativo com os filtros existentes** da tela: busca, entregador, cidade,
+  faixa de dias, ordenação, operação atual.
+- **Não altera o SLA principal** — é puramente visual/operacional na tela ENTRADA.
+- **Contador** prefixa `"Críticas: N registros"` em vermelho quando ativo.
+- **Export Excel respeita o filtro** — o que está visível é o que sai no arquivo
+  (efeito do refactor que centralizou a lógica em `_filteredOpRows(type)`).
+- Toggle: clica de novo para limpar.
+
+Funções relevantes em `GestãoEntregas.html`:
+
+| Função | Papel |
+|---|---|
+| `_filteredOpRows(type)` | Fonte única de remessas para tabela + export (rota/cust/entrada/trav) |
+| `renderOp('entrada')` | Renderiza a tabela usando `_filteredOpRows` |
+| `exportOp('entrada')` | Exporta xlsx usando `_filteredOpRows` (= o que está visível) |
+| `toggleEntradaCriticas()` | Inverte o estado `_entradaCriticas`, atualiza classe do botão, re-render |
+
+> **Bug menor corrigido junto:** antes desta feature, `exportOp` exportava
+> todas as remessas do status ignorando os filtros visíveis. Agora as 4
+> telas (rota/cust/entrada/trav) têm comportamento "exporta o que vê".
+
+Adicionado em: PR #2 (commit `5e73725`, mergeado em 2026-05-18).
+
 ---
 
 ## 4. Aba Entregador
@@ -1305,4 +1341,4 @@ LOG_JSON=1
 ---
 
 *Documento mantido por: André Teles / equipe de desenvolvimento*  
-*Última atualização: 2026-05-15 (rev4) — branch `dev/profissionalizacao-core` (P1-P8)*
+*Última atualização: 2026-05-18 (rev5) — adiciona seção 3.6 (filtro Críticas na ENTRADA, PR #2)*
